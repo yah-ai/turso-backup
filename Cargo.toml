@@ -1,0 +1,39 @@
+[package]
+name = "turso-backup"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Tier 1a sibling crate shape: depends on turso via crates.io (no re-exports),
+# uses object_store for S3-compatible upload/download. Async via tokio.
+# R003-T1 spike: sibling >> wrapper; name confirmed; deps pinned for tier 1a.
+# Backing doc: .yah/docs/working/turso-s3-backup.md
+
+[dependencies]
+turso = "0.6.1"
+# Tier 2 raw WAL seam (wal_state / wal_get_frame / wal_auto_actions_disable /
+# wal_insert_*) lives on turso_core::Connection behind feature='conn_raw_api'.
+# The friendly `turso` wrapper does NOT re-export it (R005-T1 finding), so we
+# take a sibling dep pinned in lockstep with turso=0.6.1. If versions drift,
+# cargo will refuse a duplicate transitive; bump both together.
+turso_core = { version = "0.6.1", features = ["conn_raw_api"] }
+# `aws` feature: needed by the `turso-backup-snapshot` bin to build an
+# AmazonS3-shaped store from env vars. The library API stays
+# backend-agnostic (Arc<dyn ObjectStore>); pulling `aws` in here just lets
+# the in-crate bin construct the most common backend without consumers
+# repeating the dep + features. R006-F2.
+object_store = { version = "0.13", features = ["aws"] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "macros"] }
+# Snapshot fingerprint (skip-if-unchanged): turso does NOT maintain the on-disk
+# SQLite change_counter (it stays 1 in every journal mode — verified), so the
+# guard hashes the source files instead. See snapshot.rs + the working doc.
+sha2 = "0.10"
+hex = "0.4"
+
+# One-shot snapshot CLI: drives snapshot_and_upload from env vars and prints
+# a single JSON line on the outcome so a task-runs beholder (or any
+# almanac-shaped driver) can parse it directly. R006-F2.
+[[bin]]
+name = "turso-backup-snapshot"
+path = "src/bin/snapshot.rs"

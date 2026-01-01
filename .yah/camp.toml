@@ -1,0 +1,17 @@
+#:schema ../../../.yah/schema/camp.toml.schema.json
+
+# turso-backup is a sibling open-source-bound crate that yah depends on via
+# path dep from external/db_test (and eventually yah-desktop). This .yah/ is
+# present as a SUBCAMP BOUNDARY only — the walker's is_skipped rule in
+# crates/yah/kg-store/src/walker.rs prunes any subdir that contains its own
+# .yah/ from the parent camp's scan, so this empty config stops yah-root from
+# indexing turso-backup/src/* tickets into yah-root's board.
+#
+# When R452 lands (camp.toml `[scan]` block with exclude_paths + peer_paths),
+# this directory marker becomes redundant — yah-root can exclude `external/`
+# explicitly without the per-project sentinel.
+#
+# Until then, do not file @yah: ticket annotations against turso-backup
+# source: there is no active camp here, so no board picks them up.
+
+name = "turso-backup"

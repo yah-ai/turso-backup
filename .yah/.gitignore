@@ -1,0 +1,13 @@
+/sessions
+/cache
+/jit
+/cloud
+/db
+/forms
+/operator-state.json
+/clipboard/
+/pending-payloads/
+/claude-spawn-settings.json
+/working-set
+.DS_Store
+/summaries/summary-*.md

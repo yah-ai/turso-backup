@@ -3001,7 +3001,7 @@ dependencies = [
 
 [[package]]
 name = "turso-backup"
-version = "0.8.13"
+version = "0.8.14"
 dependencies = [
  "anyhow",
  "hex",

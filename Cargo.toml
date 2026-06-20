@@ -1,6 +1,6 @@
 [package]
 name = "turso-backup"
-version = "0.0.0"
+version = "0.8.13"
 edition = "2021"
 publish = false
 

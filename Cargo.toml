@@ -37,3 +37,11 @@ hex = "0.4"
 [[bin]]
 name = "turso-backup-snapshot"
 path = "src/bin/snapshot.rs"
+
+# §8 capacity measurement: open N Turso DBs, attach a warm-applier
+# connection to each, stream WAL through it, and print an NDJSON RSS-vs-
+# db-count curve (slope = per-replica memory cost, intercept = engine
+# baseline). R574-T1; see rss_harness.rs module doc + W253 §8.
+[[bin]]
+name = "turso-backup-rss-harness"
+path = "src/bin/rss_harness.rs"

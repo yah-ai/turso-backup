@@ -24,12 +24,24 @@ turso_core = { version = "0.6.1", features = ["conn_raw_api"] }
 # repeating the dep + features. R006-F2.
 object_store = { version = "0.13", features = ["aws"] }
 anyhow = "1"
-tokio = { version = "1", features = ["rt", "macros"] }
+# "time" added for R574-F2: the R2-backpressure retry loop (stream.rs /
+# backpressure.rs) needs tokio::time::sleep for 429/503 backoff.
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 # Snapshot fingerprint (skip-if-unchanged): turso does NOT maintain the on-disk
 # SQLite change_counter (it stays 1 in every journal mode — verified), so the
 # guard hashes the source files instead. See snapshot.rs + the working doc.
 sha2 = "0.10"
 hex = "0.4"
+
+# R574-F2 test-only fake R2 client (backpressure::fault_injection::FaultyStore)
+# implements object_store::ObjectStore directly so tests can inject 429/503
+# without a real endpoint. Both are already resolved transitively via
+# object_store itself (async-trait backs its own `#[async_trait]` trait def;
+# futures-util backs its `BoxStream` methods) — pinned here at the same
+# already-locked majors, not a new crate entering the graph.
+[dev-dependencies]
+async-trait = "0.1"
+futures-util = "0.3"
 
 # One-shot snapshot CLI: drives snapshot_and_upload from env vars and prints
 # a single JSON line on the outcome so a task-runs beholder (or any

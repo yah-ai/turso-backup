@@ -3004,6 +3004,8 @@ name = "turso-backup"
 version = "0.8.18"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "futures-util",
  "hex",
  "object_store",
  "sha2",

@@ -142,6 +142,8 @@ async fn main() -> Result<()> {
             let cfg = StreamConfig {
                 base_snapshot_key: &base_key,
                 page_size: PAGE_SIZE,
+                backpressure: turso_backup::backpressure::BackpressureConfig::default(),
+                rpo_target: None,
             };
             tail_frames(&seam, &target, &cfg)
                 .await

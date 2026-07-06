@@ -31,3 +31,4 @@
 pub mod snapshot;
 pub mod dedup;
 pub mod stream;
+pub mod backpressure;

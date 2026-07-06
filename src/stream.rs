@@ -84,13 +84,37 @@
 //! @yah:next("User: review/approve F4. Once green, archive F4 and R005 collapses to closed (R005-F2/F3/F4 all in review).")
 //! @yah:verify("cargo test -p turso-backup: 38/38 green (up from 31). New: 5 unit tests on replay_wal_onto_main with MockWal (empty-WAL/single-commit/uncommitted-tail-dropped/multi-commit-prefix-grows-image/only-uncommitted-frames-returns-main) + 2 live tests on raw_consistent_copy_live (live_db_consistent_copy_without_truncate_round_trips: seed -> checkpoint_truncate -> seed more uncheckpointed -> copy-live -> reopen = 35 rows; live_db_consistent_copy_reflects_new_writes: repeatable copy after subsequent writes).")
 //! @yah:verify("cargo clippy --all-targets -- --deny=warnings: clean.")
+//!
+//! ## R574-F2 — explicit R2 backpressure
+//!
+//! `tail_frames`'s upload loop drains frames through
+//! [`crate::backpressure::put_with_backoff`] against a bounded spill buffer
+//! (see [`drain_frames_with_backpressure`]) instead of putting each frame
+//! directly and bubbling any error raw. Full design in the `backpressure`
+//! module doc; ticket tracked in the W248 relay, not in-source.
+//! @arch:see(.yah/docs/working/W248-wal-streamer-hardening.md)
+//!
+//! ## R574-T4 — explicit RPO knob
+//!
+//! Cadence was entirely implicit in the caller's `tail_frames` invocation
+//! interval (doc §10). `StreamConfig::rpo_target` states that interval as a
+//! number; every `tail_frames` call reports [`RpoStatus`] (age of the last
+//! durably-persisted watermark, and whether that age has drifted past the
+//! target) on its [`StreamOutcome`] so an orchestrator can alert without
+//! reimplementing the bookkeeping. This crate still does not schedule
+//! anything itself — cadence/retention policy stays caller-driven per the
+//! doc's "Not in scope" — `rpo_target` documents the contract the caller's
+//! own scheduler is expected to uphold, and `RpoStatus` is the receipt.
+//! @arch:see(.yah/docs/working/W248-wal-streamer-hardening.md)
 
 use anyhow::{Context, Result};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt};
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::backpressure::{put_with_backoff, BackpressureConfig, BackpressurePolicy, BackpressureReport};
 use crate::snapshot::BackupTarget;
 
 /// WAL frame layout: 24-byte frame header (page_no big-endian at 0..4,
@@ -254,13 +278,32 @@ pub struct StreamConfig<'a> {
     /// Required because the seam does not return it and `sync_server.rs`'s
     /// 4 KB hardcode is the wrong default to inherit.
     pub page_size: usize,
+    /// R574-F2: bounded spill buffer + overflow policy + 429/503 backoff
+    /// for the R2 upload side of the drain loop. `Default` is
+    /// behavior-preserving (`BackpressurePolicy::Fail` — errors bubble
+    /// immediately, same as before this field existed).
+    pub backpressure: BackpressureConfig,
+    /// R574-T4: the stated RPO bound — the caller's own scheduler is
+    /// expected to invoke `tail_frames` often enough that the watermark
+    /// never goes stale past this. `None` (the default) means no target is
+    /// asserted; [`RpoStatus::breached`] is always `false` in that case,
+    /// but [`RpoStatus::watermark_age`] is still reported so a caller can
+    /// observe the real gap before picking a number.
+    pub rpo_target: Option<Duration>,
 }
 
 /// What a [`tail_frames`] call did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamOutcome {
     /// No new frames since the last tail — sink is already current.
-    Empty { watermark: Watermark },
+    Empty {
+        watermark: Watermark,
+        /// R574-T4: staleness of the last durably-persisted watermark —
+        /// still meaningful here, since "nothing new to stream" and "the
+        /// caller's scheduler stopped invoking us" look identical from the
+        /// engine's side and only this field tells them apart.
+        rpo: RpoStatus,
+    },
     /// Uploaded a contiguous range of frames and wrote a generation manifest.
     Streamed {
         generation_key: String,
@@ -268,6 +311,11 @@ pub enum StreamOutcome {
         last_frame: u64,
         checkpoint_seq: u32,
         frame_count: u64,
+        /// R574-F2: backpressure activity during this call (policy,
+        /// high-water spill-buffer occupancy, shed count, throttle retries).
+        backpressure: BackpressureReport,
+        /// R574-T4: see [`StreamOutcome::Empty::rpo`].
+        rpo: RpoStatus,
     },
     /// The WAL header restarted since the last tail (`checkpoint_seq`
     /// advanced). Frames `1..N` in the new sequence are uploaded; the sink
@@ -280,7 +328,44 @@ pub enum StreamOutcome {
         first_frame: u64,
         last_frame: u64,
         frame_count: u64,
+        /// R574-F2: see [`StreamOutcome::Streamed::backpressure`].
+        backpressure: BackpressureReport,
+        /// R574-T4: see [`StreamOutcome::Empty::rpo`].
+        rpo: RpoStatus,
     },
+    /// R574-F2: `BackpressurePolicy::Shed` dropped every buffered frame in
+    /// this call before any of them persisted (R2 was throttling harder
+    /// than the spill buffer + backoff could absorb). No manifest/watermark
+    /// was written — the next `tail_frames` call re-attempts the same
+    /// range from the unchanged prior watermark. Distinct from `Empty`,
+    /// which means the engine itself had nothing new.
+    Shed {
+        checkpoint_seq: u32,
+        first_frame: u64,
+        last_frame: u64,
+        backpressure: BackpressureReport,
+        /// R574-T4: see [`StreamOutcome::Empty::rpo`].
+        rpo: RpoStatus,
+    },
+}
+
+/// R574-T4: watermark-staleness snapshot for RPO drift alerting, computed
+/// fresh on every `tail_frames` call against [`StreamConfig::rpo_target`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RpoStatus {
+    /// The stated bound from `StreamConfig::rpo_target`, echoed back for
+    /// convenience (so a caller reading only the outcome still knows what
+    /// was being enforced).
+    pub target: Option<Duration>,
+    /// Elapsed time since the watermark last durably advanced, measured at
+    /// the start of this call. `None` when the sink has never persisted a
+    /// watermark — there is nothing yet to measure staleness against.
+    pub watermark_age: Option<Duration>,
+    /// `true` when both `target` and `watermark_age` are set and
+    /// `watermark_age > target` — the RPO bound is breached and an
+    /// orchestrator should alert. Always `false` when no target is
+    /// configured.
+    pub breached: bool,
 }
 
 impl BackupTarget {
@@ -326,7 +411,14 @@ pub async fn tail_frames<S: WalSeam>(
     cfg: &StreamConfig<'_>,
 ) -> Result<StreamOutcome> {
     let current = seam.wal_state()?;
-    let prior = read_watermark(&target.store, &target.watermark_key()).await?;
+    let persisted = read_watermark(&target.store, &target.watermark_key()).await?;
+    // R574-T4: staleness measured at call start, against the *prior*
+    // sidecar write — i.e. how long the sink had gone without durable
+    // progress before this call ran. On the steady cadence the caller's
+    // scheduler promises, this hovers at the invocation interval; a
+    // skipped/late run pushes it past `rpo_target` and flips `breached`.
+    let rpo = rpo_status(cfg.rpo_target, persisted.as_ref());
+    let prior = persisted.map(|p| p.watermark);
 
     // Decide the range to upload.
     let (start_frame, restarted) = match prior {
@@ -336,26 +428,39 @@ pub async fn tail_frames<S: WalSeam>(
     };
 
     if current.last_frame < start_frame {
-        return Ok(StreamOutcome::Empty { watermark: current });
+        return Ok(StreamOutcome::Empty { watermark: current, rpo });
     }
 
-    // Upload frames in ascending order so a partial failure leaves a prefix
-    // (the manifest is written last, so a prefix without a manifest is
-    // invisible to restore — the next tail just overwrites the same keys).
-    let frame_size = WAL_FRAME_HEADER_SIZE + cfg.page_size;
-    let mut buf = vec![0u8; frame_size];
-    for frame_no in start_frame..=current.last_frame {
-        seam.wal_get_frame(frame_no, &mut buf)
-            .with_context(|| format!("reading wal frame {frame_no}"))?;
-        let key = target.frame_key(current.checkpoint_seq, frame_no);
-        target
-            .store
-            .put(&key, buf.clone().into())
-            .await
-            .with_context(|| format!("uploading wal frame {frame_no} to {key}"))?;
-    }
+    // Drain frames in ascending order through the bounded spill buffer +
+    // backpressure policy (R574-F2). A partial upload leaves a prefix (the
+    // manifest is written last, so a prefix without a manifest is invisible
+    // to restore — the next tail just overwrites the same keys).
+    let drain = drain_frames_with_backpressure(
+        seam,
+        target,
+        cfg,
+        current.checkpoint_seq,
+        start_frame,
+        current.last_frame,
+    )
+    .await?;
+
+    let Some(uploaded_through) = drain.uploaded_through else {
+        // BackpressurePolicy::Shed dropped everything before any frame
+        // persisted — no manifest/watermark write, so the next call
+        // re-attempts this exact range from the unchanged prior watermark.
+        return Ok(StreamOutcome::Shed {
+            checkpoint_seq: current.checkpoint_seq,
+            first_frame: start_frame,
+            last_frame: current.last_frame,
+            backpressure: drain.report,
+            rpo,
+        });
+    };
 
     // Write the generation manifest, then update the watermark sidecar.
+    // Under a Shed policy that persisted a partial prefix, both cover only
+    // `start_frame..=uploaded_through`, not the full engine range.
     let nanos = unix_nanos();
     let gen_key = target.generation_key(nanos);
     let manifest = format_generation_manifest(GenerationManifest {
@@ -363,16 +468,21 @@ pub async fn tail_frames<S: WalSeam>(
         page_size: cfg.page_size,
         checkpoint_seq: current.checkpoint_seq,
         first_frame: start_frame,
-        last_frame: current.last_frame,
+        last_frame: uploaded_through,
     });
     target
         .store
         .put(&gen_key, manifest.into_bytes().into())
         .await
         .with_context(|| format!("writing generation manifest {gen_key}"))?;
-    write_watermark(&target.store, &target.watermark_key(), current).await?;
+    write_watermark(
+        &target.store,
+        &target.watermark_key(),
+        Watermark { checkpoint_seq: current.checkpoint_seq, last_frame: uploaded_through },
+    )
+    .await?;
 
-    let frame_count = current.last_frame - start_frame + 1;
+    let frame_count = uploaded_through - start_frame + 1;
     let gen_key = gen_key.to_string();
     if restarted {
         Ok(StreamOutcome::Restarted {
@@ -380,18 +490,99 @@ pub async fn tail_frames<S: WalSeam>(
             previous_checkpoint_seq: prior.map(|p| p.checkpoint_seq).unwrap_or(0),
             new_checkpoint_seq: current.checkpoint_seq,
             first_frame: start_frame,
-            last_frame: current.last_frame,
+            last_frame: uploaded_through,
             frame_count,
+            backpressure: drain.report,
+            rpo,
         })
     } else {
         Ok(StreamOutcome::Streamed {
             generation_key: gen_key,
             first_frame: start_frame,
-            last_frame: current.last_frame,
+            last_frame: uploaded_through,
             checkpoint_seq: current.checkpoint_seq,
             frame_count,
+            backpressure: drain.report,
+            rpo,
         })
     }
+}
+
+/// Outcome of [`drain_frames_with_backpressure`]: the last frame_no
+/// successfully persisted this call (`None` if every buffered frame was
+/// shed before any of them landed) plus the backpressure activity report.
+struct DrainOutcome {
+    uploaded_through: Option<u64>,
+    report: BackpressureReport,
+}
+
+/// Read WAL frames `start_frame..=last_frame` into a bounded spill buffer
+/// (`cfg.backpressure.spill_buffer_frames`) and drain them to `target`'s
+/// object store one at a time through [`put_with_backoff`] (R574-F2).
+///
+/// The buffer only refills up to its bound, so once full the loop must
+/// resolve the head frame — either by a successful upload or by the
+/// configured [`BackpressurePolicy`] deciding what "stuck" means:
+/// `Block` retries the head forever on a throttling error (no data loss,
+/// but the call can run long); `Fail` bubbles the error once
+/// `backoff.max_retries` is exhausted (nothing persists past what already
+/// landed); `Shed` drops the whole buffered backlog (loudly, via the
+/// returned report) and returns whatever prefix already persisted. Any
+/// non-throttling error bubbles immediately regardless of policy — this
+/// mechanism is specifically for R2 throttling, not general fault
+/// tolerance.
+async fn drain_frames_with_backpressure<S: WalSeam>(
+    seam: &S,
+    target: &BackupTarget,
+    cfg: &StreamConfig<'_>,
+    checkpoint_seq: u32,
+    start_frame: u64,
+    last_frame: u64,
+) -> Result<DrainOutcome> {
+    let bp = &cfg.backpressure;
+    let frame_size = WAL_FRAME_HEADER_SIZE + cfg.page_size;
+    let bound = bp.spill_buffer_frames.max(1);
+
+    let mut report = BackpressureReport { policy: bp.policy, ..Default::default() };
+    let mut pending: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
+    let mut uploaded_through: Option<u64> = None;
+    let mut next_to_read = start_frame;
+    let mut buf = vec![0u8; frame_size];
+
+    loop {
+        // Refill up to the bound while there's more WAL to read. Once full,
+        // the head frame must be resolved before we accept more.
+        while pending.len() < bound && next_to_read <= last_frame {
+            seam.wal_get_frame(next_to_read, &mut buf)
+                .with_context(|| format!("reading wal frame {next_to_read}"))?;
+            pending.push_back((next_to_read, buf.clone()));
+            next_to_read += 1;
+            report.high_water_frames = report.high_water_frames.max(pending.len());
+        }
+        let Some((frame_no, bytes)) = pending.front().cloned() else {
+            break; // Fully drained: nothing buffered, nothing left to read.
+        };
+        let key = target.frame_key(checkpoint_seq, frame_no);
+        match put_with_backoff(&target.store, &key, bytes.into(), bp, &mut report.throttle_retries)
+            .await
+        {
+            Ok(_) => {
+                pending.pop_front();
+                uploaded_through = Some(frame_no);
+            }
+            Err(e) => match bp.policy {
+                BackpressurePolicy::Shed => {
+                    report.frames_shed += pending.len() as u64;
+                    return Ok(DrainOutcome { uploaded_through, report });
+                }
+                BackpressurePolicy::Block | BackpressurePolicy::Fail => {
+                    return Err(e)
+                        .with_context(|| format!("uploading wal frame {frame_no} to {key}"));
+                }
+            },
+        }
+    }
+    Ok(DrainOutcome { uploaded_through, report })
 }
 
 /// Take a raw, point-in-time-consistent byte image of the database at `db_path`
@@ -821,21 +1012,45 @@ pub fn parse_generation_manifest(text: &str) -> Result<OwnedGenerationManifest> 
     })
 }
 
+/// A watermark as read back from the sidecar: the engine position plus the
+/// wall-clock instant the sidecar was last written (R574-T4 — this is what
+/// [`RpoStatus::watermark_age`] measures against). `written_at_nanos` is
+/// `None` for sidecars written before the timestamp field existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistedWatermark {
+    watermark: Watermark,
+    written_at_nanos: Option<u128>,
+}
+
+/// Sidecar format: `<checkpoint_seq> <last_frame> [<written_at_unix_nanos>]`.
+/// The third field was added by R574-T4; a two-field sidecar (pre-T4 writer)
+/// still parses, with `written_at_nanos = None` — the RPO age is simply
+/// unknown until the next write stamps it.
 async fn read_watermark(
     store: &Arc<dyn ObjectStore>,
     key: &ObjPath,
-) -> Result<Option<Watermark>> {
+) -> Result<Option<PersistedWatermark>> {
     match store.get(key).await {
         Ok(res) => {
             let bytes = res.bytes().await.context("reading watermark sidecar")?;
             let s = String::from_utf8_lossy(&bytes);
-            let (seq, frame) = s
-                .trim()
-                .split_once(' ')
-                .context("watermark sidecar must be '<checkpoint_seq> <last_frame>'")?;
-            Ok(Some(Watermark {
-                checkpoint_seq: seq.parse().context("watermark checkpoint_seq")?,
-                last_frame: frame.parse().context("watermark last_frame")?,
+            let mut fields = s.split_whitespace();
+            let seq = fields
+                .next()
+                .context("watermark sidecar must be '<checkpoint_seq> <last_frame> [<nanos>]'")?;
+            let frame = fields
+                .next()
+                .context("watermark sidecar must be '<checkpoint_seq> <last_frame> [<nanos>]'")?;
+            let written_at_nanos = fields
+                .next()
+                .map(|n| n.parse::<u128>().context("watermark written_at nanos"))
+                .transpose()?;
+            Ok(Some(PersistedWatermark {
+                watermark: Watermark {
+                    checkpoint_seq: seq.parse().context("watermark checkpoint_seq")?,
+                    last_frame: frame.parse().context("watermark last_frame")?,
+                },
+                written_at_nanos,
             }))
         }
         Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -848,12 +1063,23 @@ async fn write_watermark(
     key: &ObjPath,
     w: Watermark,
 ) -> Result<()> {
-    let body = format!("{} {}\n", w.checkpoint_seq, w.last_frame);
+    let body = format!("{} {} {}\n", w.checkpoint_seq, w.last_frame, unix_nanos());
     store
         .put(key, body.into_bytes().into())
         .await
         .with_context(|| format!("writing watermark sidecar {key}"))?;
     Ok(())
+}
+
+/// R574-T4: compute the watermark-staleness snapshot for this call. Pure so
+/// the breach edge cases are unit-testable without staging a sidecar.
+fn rpo_status(target: Option<Duration>, prior: Option<&PersistedWatermark>) -> RpoStatus {
+    let watermark_age = prior
+        .and_then(|p| p.written_at_nanos)
+        .and_then(|written_at| unix_nanos().checked_sub(written_at))
+        .map(|nanos| Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)));
+    let breached = matches!((target, watermark_age), (Some(t), Some(age)) if age > t);
+    RpoStatus { target, watermark_age, breached }
 }
 
 fn join_key(prefix: &str, leaf: &str) -> ObjPath {
@@ -875,8 +1101,11 @@ fn unix_nanos() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backpressure::fault_injection::{Fault, FaultyStore};
+    use crate::backpressure::BackoffConfig;
     use object_store::memory::InMemory;
     use std::cell::RefCell;
+    use std::time::Duration;
 
     /// In-memory WAL seam: a fixed page_size, a vector of frames the test
     /// appends to, and an advancing checkpoint_seq the test can bump.
@@ -965,7 +1194,321 @@ mod tests {
         StreamConfig {
             base_snapshot_key: "backups/snapshots/snapshot-00000000000000000001.db",
             page_size: 4096,
+            backpressure: BackpressureConfig::default(),
+            rpo_target: None,
         }
+    }
+
+    /// Fast-ticking backoff for backpressure tests — a few ms, never the
+    /// production defaults, so retry-heavy tests stay fast.
+    fn fast_backoff() -> BackoffConfig {
+        BackoffConfig {
+            initial_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(4),
+            multiplier: 2.0,
+            max_retries: 3,
+        }
+    }
+
+    fn bp_cfg(policy: BackpressurePolicy, spill_buffer_frames: usize) -> StreamConfig<'static> {
+        StreamConfig {
+            base_snapshot_key: "backups/snapshots/snapshot-00000000000000000001.db",
+            page_size: 4096,
+            backpressure: BackpressureConfig {
+                spill_buffer_frames,
+                policy,
+                backoff: fast_backoff(),
+            },
+            rpo_target: None,
+        }
+    }
+
+    fn faulty_target(faults: impl IntoIterator<Item = Fault>) -> BackupTarget {
+        BackupTarget {
+            store: Arc::new(FaultyStore::new(Arc::new(InMemory::new()), faults)),
+            prefix: "backups".into(),
+        }
+    }
+
+    /// Five WAL frames (1..=5), the last a commit — a small, deterministic
+    /// range for the backpressure tests below.
+    fn five_frame_seam() -> MockWal {
+        let seam = MockWal::new(4096);
+        for i in 1..=4u32 {
+            seam.append(i, 0, i as u8);
+        }
+        seam.append(5, 5, 5); // commit
+        seam
+    }
+
+    // --- R574-F2: explicit R2 backpressure ---------------------------------
+
+    /// A single 429 triggers exactly one retry, then the upload succeeds —
+    /// the whole range still lands and the report shows the retry.
+    #[tokio::test]
+    async fn throttled_429_retries_then_succeeds() {
+        let seam = five_frame_seam();
+        let target = faulty_target([Fault::TooManyRequests]);
+        let cfg = bp_cfg(BackpressurePolicy::Fail, 8);
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { frame_count, backpressure, .. } => {
+                assert_eq!(frame_count, 5);
+                assert_eq!(backpressure.throttle_retries, 1);
+                assert_eq!(backpressure.frames_shed, 0);
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+    }
+
+    /// A 503 is classified the same as a 429 and also triggers backoff then
+    /// retry — two 503s in a row cost exactly two retries.
+    #[tokio::test]
+    async fn throttled_503_retries_then_succeeds() {
+        let seam = five_frame_seam();
+        let target = faulty_target([Fault::ServiceUnavailable, Fault::ServiceUnavailable]);
+        let cfg = bp_cfg(BackpressurePolicy::Fail, 8);
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { frame_count, backpressure, .. } => {
+                assert_eq!(frame_count, 5);
+                assert_eq!(backpressure.throttle_retries, 2);
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+    }
+
+    /// Buffer at bound + `Fail`: sustained throttling exhausts backoff and
+    /// the whole call errors — nothing is persisted.
+    #[tokio::test]
+    async fn buffer_at_bound_fail_policy_errors_without_persisting() {
+        let seam = five_frame_seam();
+        let faults = std::iter::repeat_n(Fault::TooManyRequests, 50);
+        let target = faulty_target(faults);
+        let cfg = bp_cfg(BackpressurePolicy::Fail, 2);
+        let err = tail_frames(&seam, &target, &cfg).await.unwrap_err();
+        assert!(format!("{err}").contains("uploading wal frame"), "err was {err}");
+        assert!(
+            read_watermark(&target.store, &target.watermark_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "Fail must not persist a watermark when it gives up"
+        );
+    }
+
+    /// Buffer at bound + `Shed`: the backlog is dropped with a loud report
+    /// instead of erroring; nothing persists, so the next call would
+    /// re-attempt the same range.
+    #[tokio::test]
+    async fn buffer_at_bound_shed_policy_drops_backlog_without_error() {
+        let seam = five_frame_seam();
+        let faults = std::iter::repeat_n(Fault::TooManyRequests, 50);
+        let target = faulty_target(faults);
+        let cfg = bp_cfg(BackpressurePolicy::Shed, 2);
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        match out {
+            StreamOutcome::Shed { first_frame, last_frame, backpressure, .. } => {
+                assert_eq!(first_frame, 1);
+                assert_eq!(last_frame, 5);
+                assert_eq!(backpressure.high_water_frames, 2, "capped at the bound");
+                assert!(backpressure.frames_shed >= 1, "must report the dropped backlog");
+            }
+            other => panic!("expected Shed, got {other:?}"),
+        }
+        assert!(
+            read_watermark(&target.store, &target.watermark_key())
+                .await
+                .unwrap()
+                .is_none(),
+            "Shed must not persist a watermark for a fully-dropped batch"
+        );
+    }
+
+    /// Buffer at bound + `Block`: retries never give up on a throttling
+    /// error; once the store recovers, the full range still lands.
+    #[tokio::test]
+    async fn buffer_at_bound_block_policy_eventually_drains() {
+        let seam = five_frame_seam();
+        // More failures than fast_backoff's max_retries would tolerate under
+        // Fail/Shed — Block must push through them anyway.
+        let faults = std::iter::repeat_n(Fault::TooManyRequests, 4);
+        let target = faulty_target(faults);
+        let cfg = bp_cfg(BackpressurePolicy::Block, 2);
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { frame_count, backpressure, .. } => {
+                assert_eq!(frame_count, 5);
+                assert_eq!(backpressure.high_water_frames, 2);
+                assert_eq!(backpressure.throttle_retries, 4);
+                assert_eq!(backpressure.frames_shed, 0);
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+    }
+
+    /// The high-water mark reports the peak spill-buffer occupancy for the
+    /// call, capped at the configured bound even when more frames remain.
+    #[tokio::test]
+    async fn high_water_reports_peak_buffered_frames() {
+        let seam = five_frame_seam();
+        let target = faulty_target([]); // no faults — pure high-water measurement
+        let cfg = bp_cfg(BackpressurePolicy::Fail, 3);
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { backpressure, .. } => {
+                assert_eq!(backpressure.high_water_frames, 3, "capped at the configured bound");
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+    }
+
+    // --- R574-T4: explicit RPO knob --------------------------------------
+
+    /// First tail ever: no sidecar, so age is unknown and a configured
+    /// target cannot be breached (there is nothing to measure against).
+    #[tokio::test]
+    async fn rpo_first_tail_has_unknown_age_and_no_breach() {
+        let seam = five_frame_seam();
+        let target = fresh_target();
+        let mut cfg = cfg();
+        cfg.rpo_target = Some(Duration::from_secs(1));
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { rpo, .. } => {
+                assert_eq!(rpo.target, Some(Duration::from_secs(1)));
+                assert_eq!(rpo.watermark_age, None);
+                assert!(!rpo.breached);
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+    }
+
+    /// Second tail past the target: the sidecar's stamped write instant is
+    /// older than `rpo_target`, so the outcome flags a breach — the
+    /// staleness emission the orchestrator alerts on.
+    #[tokio::test]
+    async fn rpo_stale_watermark_past_target_reports_breach() {
+        let seam = MockWal::new(4096);
+        seam.append(1, 1, 0xAA);
+        let target = fresh_target();
+        let mut cfg = cfg();
+        // Zero target: any measurable gap between the two tails is a breach.
+        cfg.rpo_target = Some(Duration::ZERO);
+        let _ = tail_frames(&seam, &target, &cfg).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        seam.append(2, 2, 0xBB);
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { rpo, .. } => {
+                let age = rpo.watermark_age.expect("age known after first sidecar write");
+                assert!(age >= Duration::from_millis(5), "age was {age:?}");
+                assert!(rpo.breached, "zero target must flag any nonzero age");
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+    }
+
+    /// A generous target with a prompt second tail: age is reported but the
+    /// bound holds — and with no target at all, `breached` is always false.
+    #[tokio::test]
+    async fn rpo_within_target_and_no_target_do_not_breach() {
+        let seam = MockWal::new(4096);
+        seam.append(1, 1, 0xAA);
+        let target = fresh_target();
+        let mut with_target = cfg();
+        with_target.rpo_target = Some(Duration::from_secs(3600));
+        let _ = tail_frames(&seam, &target, &with_target).await.unwrap();
+
+        seam.append(2, 2, 0xBB);
+        let out = tail_frames(&seam, &target, &with_target).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { rpo, .. } => {
+                assert!(rpo.watermark_age.is_some());
+                assert!(!rpo.breached, "an hour budget can't be blown in-process");
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+
+        // Same staged sidecar, target removed: age still reported, never
+        // breached (observe-before-you-pick-a-number mode).
+        seam.append(3, 3, 0xCC);
+        let out = tail_frames(&seam, &target, &cfg()).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { rpo, .. } => {
+                assert_eq!(rpo.target, None);
+                assert!(rpo.watermark_age.is_some());
+                assert!(!rpo.breached);
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+    }
+
+    /// A pre-T4 two-field sidecar still parses (written_at unknown), and the
+    /// next write upgrades it to the stamped three-field format.
+    #[tokio::test]
+    async fn rpo_legacy_two_field_sidecar_parses_and_upgrades() {
+        let target = fresh_target();
+        target
+            .store
+            .put(&target.watermark_key(), b"0 1\n".to_vec().into())
+            .await
+            .unwrap();
+        let legacy = read_watermark(&target.store, &target.watermark_key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.watermark, Watermark { checkpoint_seq: 0, last_frame: 1 });
+        assert_eq!(legacy.written_at_nanos, None);
+
+        // A tail against the legacy sidecar reports unknown age (not a
+        // breach), streams the new frames, and re-stamps the sidecar.
+        let seam = MockWal::new(4096);
+        seam.append(1, 0, 0xAA);
+        seam.append(2, 2, 0xBB);
+        let mut cfg = cfg();
+        cfg.rpo_target = Some(Duration::ZERO);
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { rpo, first_frame, .. } => {
+                assert_eq!(first_frame, 2, "resumes after the legacy watermark");
+                assert_eq!(rpo.watermark_age, None);
+                assert!(!rpo.breached, "unknown age is not a breach even at zero target");
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+        let upgraded = read_watermark(&target.store, &target.watermark_key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(upgraded.written_at_nanos.is_some(), "rewrite stamps the timestamp");
+    }
+
+    /// Pure rpo_status edge cases that don't need a staged store.
+    #[test]
+    fn rpo_status_truth_table() {
+        let stamped = |nanos_ago: u128| PersistedWatermark {
+            watermark: Watermark { checkpoint_seq: 0, last_frame: 1 },
+            written_at_nanos: Some(unix_nanos().saturating_sub(nanos_ago)),
+        };
+        // No prior at all.
+        let s = rpo_status(Some(Duration::from_secs(1)), None);
+        assert_eq!((s.watermark_age, s.breached), (None, false));
+        // Prior without a stamp (legacy sidecar).
+        let legacy = PersistedWatermark {
+            watermark: Watermark::default(),
+            written_at_nanos: None,
+        };
+        let s = rpo_status(Some(Duration::ZERO), Some(&legacy));
+        assert_eq!((s.watermark_age, s.breached), (None, false));
+        // Old stamp vs tight target: breached.
+        let s = rpo_status(Some(Duration::from_millis(1)), Some(&stamped(5_000_000_000)));
+        assert!(s.watermark_age.unwrap() >= Duration::from_secs(4));
+        assert!(s.breached);
+        // Old stamp, no target: age known, never breached.
+        let s = rpo_status(None, Some(&stamped(5_000_000_000)));
+        assert!(s.watermark_age.is_some());
+        assert!(!s.breached);
     }
 
     /// First tail with no frames yet — Empty, no manifest, no watermark.
@@ -975,8 +1518,10 @@ mod tests {
         let target = fresh_target();
         let out = tail_frames(&seam, &target, &cfg()).await.unwrap();
         match out {
-            StreamOutcome::Empty { watermark } => {
+            StreamOutcome::Empty { watermark, rpo } => {
                 assert_eq!(watermark, Watermark::default());
+                // No sidecar has ever been written — age is unknowable.
+                assert_eq!(rpo, RpoStatus::default());
             }
             other => panic!("expected Empty, got {other:?}"),
         }
@@ -1007,6 +1552,7 @@ mod tests {
                 last_frame,
                 checkpoint_seq,
                 frame_count,
+                ..
             } => {
                 assert_eq!(first_frame, 1);
                 assert_eq!(last_frame, 3);
@@ -1054,7 +1600,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(wm, Watermark { checkpoint_seq: 0, last_frame: 3 });
+        assert_eq!(wm.watermark, Watermark { checkpoint_seq: 0, last_frame: 3 });
+        assert!(wm.written_at_nanos.is_some(), "R574-T4: writes stamp the sidecar");
 
         // The seam was told to take WAL ownership? Not directly via
         // tail_frames — callers do that at construction (CoreWalSeam::open).
@@ -1072,10 +1619,13 @@ mod tests {
 
         let out = tail_frames(&seam, &target, &cfg()).await.unwrap();
         match out {
-            StreamOutcome::Empty { watermark } => assert_eq!(
-                watermark,
-                Watermark { checkpoint_seq: 0, last_frame: 1 },
-            ),
+            StreamOutcome::Empty { watermark, rpo } => {
+                assert_eq!(watermark, Watermark { checkpoint_seq: 0, last_frame: 1 });
+                // A sidecar exists from the first tail, so age is known even
+                // with no rpo_target configured — and no target means no breach.
+                assert!(rpo.watermark_age.is_some());
+                assert!(!rpo.breached);
+            }
             other => panic!("expected Empty, got {other:?}"),
         }
     }
@@ -1485,6 +2035,8 @@ mod tests {
             let cfg = StreamConfig {
                 base_snapshot_key: &base_key,
                 page_size: 4096,
+                backpressure: BackpressureConfig::default(),
+                rpo_target: None,
             };
             let outcome = tail_frames(&seam, &target, &cfg).await.unwrap();
             match outcome {
@@ -1554,6 +2106,8 @@ mod tests {
             let cfg = StreamConfig {
                 base_snapshot_key: &base_key,
                 page_size: 4096,
+                backpressure: BackpressureConfig::default(),
+                rpo_target: None,
             };
             let _ = tail_frames(&seam, &target, &cfg).await.unwrap();
             let w = seam.wal_state().unwrap();

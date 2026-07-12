@@ -106,6 +106,17 @@
 //! doc's "Not in scope" — `rpo_target` documents the contract the caller's
 //! own scheduler is expected to uphold, and `RpoStatus` is the receipt.
 //! @arch:see(.yah/docs/working/W248-wal-streamer-hardening.md)
+//!
+//! ## R574-F3 — one-puller-per-box fan-out + warm applier
+//!
+//! [`crate::puller::WalPuller`] is the read side's counterpart to
+//! `tail_frames`'s write side: it pulls each newly-uploaded frame from R2
+//! exactly once per box and fans it out in-process to every attached warm
+//! applier (a [`WalInsertSeam`] with its page cache trimmed hard via
+//! [`CoreWalSeam::trim_page_cache_kb`]), so R2 read ops are O(boxes), not
+//! O(replicas). See the `puller` module doc for the full design and its v1
+//! scope cut (attach is cold-start-only; no mid-stream backlog replay).
+//! @arch:see(.yah/docs/working/W248-wal-streamer-hardening.md)
 
 use anyhow::{Context, Result};
 use object_store::path::Path as ObjPath;
@@ -265,6 +276,33 @@ impl WalInsertSeam for CoreWalSeam {
         self.conn
             .wal_insert_end(force_commit)
             .context("turso_core wal_insert_end")
+    }
+}
+
+impl CoreWalSeam {
+    /// Resize this connection's page cache toward `target_kb` kilobytes via
+    /// the standard `PRAGMA cache_size` surface (negative value = KB, per
+    /// SQLite's own convention — see `turso_core::translate::pragma`'s
+    /// `update_cache_size`) rather than reaching into `turso_core`'s
+    /// `Pager::change_page_cache_size` / `CacheResizeResult` directly: the
+    /// latter are technically reachable (`Connection::get_pager()` and
+    /// `Pager`/`Page`/`PageRef` are all `pub use`d at the crate root) but
+    /// `CacheResizeResult` itself is not re-exported, so calling it from
+    /// here would mean handling a value of an unnameable type. The pragma
+    /// path exercises the exact same resize logic through turso_core's own
+    /// public, documented SQL surface instead.
+    ///
+    /// R574-F3: a warm applier trims its cache hard immediately on attach —
+    /// it never serves reads, so cached pages are pure standing RSS cost
+    /// (see the R574-T1 measurement this sizes against).
+    pub(crate) fn trim_page_cache_kb(&self, target_kb: i64) -> Result<()> {
+        anyhow::ensure!(
+            target_kb > 0,
+            "trim_page_cache_kb: target_kb must be positive, got {target_kb}"
+        );
+        self.conn
+            .execute(format!("PRAGMA cache_size = -{target_kb}"))
+            .with_context(|| format!("PRAGMA cache_size = -{target_kb}"))
     }
 }
 
@@ -906,7 +944,7 @@ pub async fn restore_latest_stream(
     })
 }
 
-async fn list_and_parse_generation_manifests(
+pub(crate) async fn list_and_parse_generation_manifests(
     target: &BackupTarget,
 ) -> Result<Vec<OwnedGenerationManifest>> {
     let prefix = join_key(&target.prefix, "generations");

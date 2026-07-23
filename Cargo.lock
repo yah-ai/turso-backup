@@ -3001,7 +3001,7 @@ dependencies = [
 
 [[package]]
 name = "turso-backup"
-version = "0.8.20"
+version = "0.8.21"
 dependencies = [
  "anyhow",
  "async-trait",

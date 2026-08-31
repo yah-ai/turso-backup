@@ -8,15 +8,62 @@
 //! ## Object layout under `BackupTarget::prefix`
 //!
 //! ```text
-//! frames/{checkpoint_seq:010}/{frame_no:020}    raw WAL frame (24-byte header + page)
-//! generations/gen-{unix_nanos:020}.manifest     one per `tail_frames` call that uploaded
-//! latest.stream-watermark                       text sidecar: "<checkpoint_seq> <last_frame>"
+//! frames/{epoch:020}/{checkpoint_seq:010}/{first:020}-{last:020}  batch of consecutive WAL frames
+//! frames/{checkpoint_seq:010}/{first:020}-{last:020}              ditto, epoch 0 (unfenced)
+//! frames/{epoch:020}/{checkpoint_seq:010}/{frame_no:020}          one raw frame, pre-R761-F2 layout
+//! frames/{checkpoint_seq:010}/{frame_no:020}                      ditto, epoch 0 (pre-fencing)
+//! generations/gen-{unix_nanos:020}.manifest                one per `tail_frames` call that uploaded
+//! latest.stream-watermark    text sidecar: "<checkpoint_seq> <last_frame> <written_at_nanos> <epoch> <pointer_generation>"
 //! ```
 //!
-//! The generation manifest names the base snapshot key, the page size, and the
-//! frame range covered. Object keys are zero-padded so lexical order matches
-//! chronological order (same convention as tier 1a snapshots / tier 1b
-//! manifests; clock-skew-immune).
+//! A frame object holds `n` consecutive frames, each `24 + page_size` bytes,
+//! concatenated in ascending frame order — so a batch is exactly the bytes the
+//! old per-frame objects held, glued together, and offset `i * frame_size`
+//! within it is frame `first + i`.
+//!
+//! The generation manifest names the base snapshot key, the page size, the
+//! frame range covered, which batch objects cover it (since R761-F2), and
+//! (since R732-F2) the fencing epoch and owner label. Object keys are
+//! zero-padded so lexical order matches chronological order (same convention as
+//! tier 1a snapshots / tier 1b manifests; clock-skew-immune).
+//!
+//! ## Frame batching (R761-F2, W248/W313 §9)
+//!
+//! One object per WAL frame made per-write Class A ops scale with *frames*,
+//! and a frame is one page — at 4 KB pages, every 4 KB of changed data was a
+//! billed op, which is a pathologically small object. A tail call's frames now
+//! go up as one ranged object per drain batch (bounded by
+//! [`BackpressureConfig::spill_buffer_frames`], the same bound that already
+//! caps how much this sink holds in memory), so an uploading call costs
+//! `ceil(frames / spill_buffer_frames) + 2` PUTs instead of `frames + 2` —
+//! typically **3, flat**, whatever the write volume in the interval.
+//!
+//! Reading stays compatible in the direction that matters: a manifest without
+//! a `frame_batch` list is a pre-R761-F2 generation and its frames are fetched
+//! one object each, so backups written before this change (and chains that
+//! straddle it) still restore. The reverse is a loud refusal by construction —
+//! the manifest header moved to `v3`, so an older binary reading a batched
+//! generation says "unexpected manifest header" rather than mis-reading it.
+//!
+//! ## Fencing (R732-F2 / R732-T3, W245; R736-T2, W250)
+//!
+//! [`StreamConfig::epoch`] is a per-tenant fencing token minted by yubaba's
+//! raft state machine. It is checked against the sidecar before any frame is
+//! uploaded, and the sidecar advance is a compare-and-swap on the version that
+//! check read — so a stale owner is *rejected* (with
+//! [`StreamOutcome::Fenced`]) both when it arrives late and when it races. An
+//! epoch of `0` means unfenced, which preserves single-writer behaviour but is
+//! still fenced *by* a claimed sink.
+//!
+//! That epoch is a **local** raft counter — it fences ownership moves within
+//! one cell, but two cells are independent raft groups that share no epoch
+//! counter, so it is blind to a tenant moving to a *different* cell.
+//! [`StreamConfig::pointer_generation`] is the second, cross-cell fence: the
+//! writer's belief about the global tenant→cell pointer's generation
+//! (`yah_tenant_pointer::PointerRecord`). It is checked alongside `epoch` at
+//! the same two points — up front against the sidecar, and again on a lost
+//! watermark CAS — so a stale generation bounces exactly like a stale epoch.
+//! A node is the real owner of a tenant only when **both** fences pass.
 //!
 //! ## Seam isolation
 //!
@@ -107,6 +154,24 @@
 //! own scheduler is expected to uphold, and `RpoStatus` is the receipt.
 //! @arch:see(.yah/docs/working/W248-wal-streamer-hardening.md)
 //!
+//! ## R761-T1 — a measured default tail cadence
+//!
+//! [`DEFAULT_TAIL_INTERVAL`] (60 s) and [`DEFAULT_RPO_TARGET`] (120 s) are
+//! the cadence this crate recommends, derived from
+//! `examples/tail_sweep_harness.rs`'s 2026-08-13 sweep rather than chosen:
+//! every uploading `tail_frames` call writes two fixed objects (generation
+//! manifest + watermark CAS) on top of the frames, so per-write cost was
+//! `frames/write + 2/writes_per_tail` — 4.03 PUTs/write at one write per
+//! tail, 2.05 at a hundred. The constants' docs carry the full table and
+//! the reasoning for landing at 60 s instead of chasing the last 3 %. Still
+//! no scheduler in this crate; these are numbers for the caller's.
+//!
+//! R761-F2 then removed the `frames/write` term those numbers were floored
+//! by (see *Frame batching* above), so the cost is now `3/writes_per_tail`
+//! for a call whose frames fit one batch — the cadence lever and the layout
+//! lever compose, and the second is worth more the longer the interval.
+//! @arch:see(.yah/docs/working/W248-wal-streamer-hardening.md)
+//!
 //! ## R574-F3 — one-puller-per-box fan-out + warm applier
 //!
 //! [`crate::puller::WalPuller`] is the read side's counterpart to
@@ -120,7 +185,7 @@
 
 use anyhow::{Context, Result};
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -306,6 +371,107 @@ impl CoreWalSeam {
     }
 }
 
+/// R761-T1: the tail cadence this crate recommends when a caller has no
+/// reason of its own to pick a different one — **60 s**, and the number is
+/// a measurement result, not a guess.
+///
+/// ## The measurement
+///
+/// `examples/tail_sweep_harness.rs`, run 2026-08-13 against a casual-app
+/// workload (single-row transactions into a table with a secondary index),
+/// sweeping `writes_per_tail` — how many application writes accumulate
+/// between two `tail_frames` calls:
+///
+/// | writes_per_tail | PUTs/write | frames/write |
+/// |----------------:|-----------:|-------------:|
+/// |               1 |       4.03 |         2.03 |
+/// |               5 |       2.43 |         2.03 |
+/// |              25 |       2.11 |         2.03 |
+/// |             100 |       2.05 |         2.03 |
+///
+/// Those four points are not four independent facts. Every `tail_frames`
+/// call that uploads anything writes exactly **two fixed objects** beyond
+/// the frames themselves — one generation manifest and one watermark CAS —
+/// so
+///
+/// ```text
+/// PUTs/write = frames/write + 2 / writes_per_tail
+/// ```
+///
+/// which reproduces all four measured rows to the last digit: `2.03 + 2/1`,
+/// `2.03 + 2/5`, `2.03 + 2/25`, `2.03 + 2/100`. frames/write is FLAT across
+/// the sweep — it is a property of the schema and transaction shape, and
+/// cadence cannot touch it. The entire lever this default pulls is the
+/// `2 / writes_per_tail` term.
+///
+/// ## Why 60 s and not longer
+///
+/// That term has sharply diminishing returns. Of the total reduction
+/// available (4.03 → 2.05), moving from `writes_per_tail` 1 → 5 captures
+/// 81 %, 1 → 25 captures 97 %, and everything from 25 → 100 is the last
+/// 3 %. So the target is the 25 region, not 100.
+///
+/// Converting that writes axis into a time interval needs a write RATE,
+/// and the honest one is the rate DURING an active session — W313 §3.1's
+/// "~10 writes/day" arrives clustered in bursts, not spread evenly, and an
+/// idle tenant costs nothing at any cadence (a tail call with no new frames
+/// uploads no objects at all, so a long interval only ever helps a tenant
+/// that is actively writing). Across the burst rates a casual app produces,
+/// ~0.1–1 write/s:
+///
+/// - 15 s (what a 30 s RPO bound derives today) spans 1.5–15 writes/tail
+///   → 3.36–2.16 PUTs/write. The slow-burst end is the worst case the
+///   ticket is named after, and it is nearly the full 4.03.
+/// - **60 s spans 6–60 writes/tail → 2.36–2.06 PUTs/write.**
+/// - 300 s spans 30–300 → 2.10–2.04: at most 0.26 PUTs/write better than
+///   60 s, bought with a 5× wider data-loss window on exactly the tenants
+///   that are actively writing. Not a trade worth making for 3 % of a
+///   bill.
+///
+/// 60 s is where the curve has flattened but the exposure window is still
+/// something an operator can say out loud.
+///
+/// ## What it did not fix, and what did
+///
+/// The 2.03 frames/write floor was untouchable from here — it was one object
+/// per WAL frame, and cadence cannot amortize a per-frame cost. **R761-F2
+/// removed it** by uploading a tail call's frames as one ranged object, so
+/// the curve above is now
+///
+/// ```text
+/// PUTs/write = 3 / writes_per_tail
+/// ```
+///
+/// (one batch object + manifest + watermark), i.e. 3.00 / 0.60 / 0.12 / 0.03
+/// at the same four points — a 26 % cut at `writes_per_tail = 1` and 98.5 %
+/// at 100. **That does not move this default**, and the reasoning above is
+/// why rather than an accident: the 60 s choice was made against the shape
+/// of the curve, and what batching changes is its scale. Over the same
+/// 0.1–1 write/s burst band, going 60 s → 300 s now buys 0.50 → 0.10
+/// PUTs/write at the slow end and 0.05 → 0.01 at the fast one — against a
+/// pre-batching worst case of 3.36, an absolute difference small enough
+/// that RPO exposure is the only term still worth optimizing here. The
+/// measured points above are kept as the pre-batching baseline the
+/// reduction is stated against.
+///
+/// Re-run the harness and revisit both numbers whenever schema shape, page
+/// size, or turso's WAL behaviour changes:
+/// `cargo run -p turso-backup --example tail_sweep_harness`.
+///
+/// This crate still schedules nothing itself (R574-T4's "document the
+/// contract" choice stands) — the constant is the number a caller's
+/// scheduler should adopt absent a reason not to, and
+/// [`DEFAULT_RPO_TARGET`] is the bound that goes with it.
+pub const DEFAULT_TAIL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// R761-T1: the RPO bound that goes with [`DEFAULT_TAIL_INTERVAL`] — twice
+/// it, because tailing *at* the bound makes ordinary scheduling jitter read
+/// as a breach, and tailing at half of it means one missed tick still lands
+/// inside the promise. See [`DEFAULT_TAIL_INTERVAL`] for why the cadence is
+/// 60 s; this is that number expressed as the promise rather than the
+/// mechanism, and it is what belongs in [`StreamConfig::rpo_target`].
+pub const DEFAULT_RPO_TARGET: Duration = Duration::from_secs(120);
+
 /// Configuration for a streaming session.
 pub struct StreamConfig<'a> {
     /// Object-store key of the base tier-1a snapshot the frames replay onto.
@@ -327,7 +493,52 @@ pub struct StreamConfig<'a> {
     /// asserted; [`RpoStatus::breached`] is always `false` in that case,
     /// but [`RpoStatus::watermark_age`] is still reported so a caller can
     /// observe the real gap before picking a number.
+    ///
+    /// R761-T1: [`DEFAULT_RPO_TARGET`] (120 s, tailed at
+    /// [`DEFAULT_TAIL_INTERVAL`] = 60 s) is the number to put here absent a
+    /// reason to pick another — its doc carries the measured write-op table
+    /// that justifies it. `None` stays the default so that a caller who has
+    /// not thought about RPO never gets a breach flag it did not ask for.
     pub rpo_target: Option<Duration>,
+    /// R732-F2 (W245): this writer's **fencing token** — the per-tenant epoch
+    /// handed out by yubaba's raft state machine
+    /// (`YubabaState::tenant_fencing_token`). It is stamped into every frame
+    /// key, every generation manifest, and the watermark sidecar, and it is
+    /// checked before a single frame is uploaded: a writer whose epoch is
+    /// *lower* than the one already recorded at the sink is a stale owner and
+    /// bounces with [`StreamOutcome::Fenced`] rather than interleaving its
+    /// frames with the real owner's.
+    ///
+    /// **`0` means unfenced**, and is the behaviour-preserving default for a
+    /// single-writer deployment that has no ownership authority to ask. Note
+    /// that unfenced is not exempt: a `0` writer is still fenced by any sink
+    /// already stamped with a real epoch, which is exactly what should happen
+    /// when a tenant has been claimed and a legacy streamer is still running.
+    pub epoch: u64,
+    /// R732-F2: opaque label for *who* holds `epoch` — a yubaba node id, a
+    /// hostname, whatever the caller finds useful. Recorded in the manifest
+    /// and never interpreted here. Purely diagnostic: when you are staring at
+    /// a fenced stream at 3am, "which owner wrote generation 7" is the first
+    /// question, and the epoch alone does not answer it.
+    pub owner: Option<&'a str>,
+    /// R736-T2 (W250): the **cross-cell** fence — this writer's belief about
+    /// the global tenant→cell pointer's generation
+    /// (`yah_tenant_pointer::PointerRecord::generation`). `epoch` alone
+    /// fences *within* one raft group; it says nothing when ownership moves
+    /// to a different cell, because the two cells run independent raft
+    /// groups that share no epoch counter. Checked alongside `epoch` before
+    /// any frame is uploaded: a writer whose generation is *lower* than the
+    /// one already recorded at the sink is a stale cell and bounces with
+    /// [`StreamOutcome::Fenced`], exactly like a stale epoch.
+    ///
+    /// **`0` means unfenced** — the same behaviour-preserving default as
+    /// `epoch`, for a single-cell deployment that has no global pointer to
+    /// ask. This mirrors `yah_tenant_pointer`'s `FIRST_GENERATION = 1`: `0`
+    /// is what an unfenced writer defaults to and must never be mistakable
+    /// for a live cross-cell owner. The caller (yubaba's control plane)
+    /// resolves the pointer and hands the generation in as a plain `u64` —
+    /// this crate does not link `yah_tenant_pointer` to read it itself.
+    pub pointer_generation: u64,
 }
 
 /// What a [`tail_frames`] call did.
@@ -385,6 +596,72 @@ pub enum StreamOutcome {
         /// R574-T4: see [`StreamOutcome::Empty::rpo`].
         rpo: RpoStatus,
     },
+    /// R732-F2 (W245) / R736-T2 (W250): **this writer is a stale owner and
+    /// wrote nothing.** Either the sink's watermark is stamped with an epoch
+    /// higher than [`StreamConfig::epoch`] (ownership moved within the cell),
+    /// or with a pointer generation higher than
+    /// [`StreamConfig::pointer_generation`] (ownership moved to a different
+    /// cell) — the two-level fence bounces on either. Detected before the
+    /// first frame upload, so a fenced call is a pure read — no frames, no
+    /// manifest, no watermark write.
+    ///
+    /// This is the outcome the whole fencing design exists to produce. Without
+    /// it a partitioned old master and a freshly-promoted new master both
+    /// stream into the same prefix and silently corrupt each other; with it
+    /// the loser finds out on its very next tail and can stop.
+    ///
+    /// Deliberately carries no [`RpoStatus`]: a fenced writer's view of
+    /// watermark staleness is not its stream's RPO any more, and reporting one
+    /// here would page the wrong operator about the wrong node.
+    Fenced {
+        /// The epoch recorded at the sink — the real owner's token.
+        current_epoch: u64,
+        /// The (lower) epoch this writer tried to stream under.
+        our_epoch: u64,
+        /// R736-T2: the pointer generation recorded at the sink.
+        current_pointer_generation: u64,
+        /// R736-T2: the (lower) generation this writer tried to stream under.
+        our_pointer_generation: u64,
+    },
+}
+
+impl StreamOutcome {
+    /// This call's RPO snapshot, or `None` for [`StreamOutcome::Fenced`] —
+    /// see that variant's doc for why it deliberately carries none.
+    ///
+    /// R782: the accessor a caller (`tenant-streamer`'s tail loop) uses to
+    /// push `watermark_age` onward without re-deriving this match on every
+    /// call site that needs it.
+    pub fn rpo(&self) -> Option<&RpoStatus> {
+        match self {
+            StreamOutcome::Empty { rpo, .. }
+            | StreamOutcome::Streamed { rpo, .. }
+            | StreamOutcome::Restarted { rpo, .. }
+            | StreamOutcome::Shed { rpo, .. } => Some(rpo),
+            StreamOutcome::Fenced { .. } => None,
+        }
+    }
+
+    /// This call's backpressure activity, or `None` for the two outcomes that
+    /// never reached the drain loop ([`StreamOutcome::Empty`] had nothing to
+    /// send, [`StreamOutcome::Fenced`] was refused before the first frame).
+    ///
+    /// R760-B8: the accessor a *multi-tenant* caller needs. `Streamed` is not
+    /// the same thing as "the sink took everything" — under
+    /// [`BackpressurePolicy::Shed`] a call that persisted a partial prefix and
+    /// dropped the rest reports `Streamed` with a nonzero
+    /// [`BackpressureReport::frames_shed`], and a caller that only matches the
+    /// variant cannot tell that apart from a clean tail. roadcase's shard
+    /// flusher reads this on every arm so a struggling cell is nameable from
+    /// its own metrics rather than by bisecting tenants.
+    pub fn backpressure(&self) -> Option<&BackpressureReport> {
+        match self {
+            StreamOutcome::Streamed { backpressure, .. }
+            | StreamOutcome::Restarted { backpressure, .. }
+            | StreamOutcome::Shed { backpressure, .. } => Some(backpressure),
+            StreamOutcome::Empty { .. } | StreamOutcome::Fenced { .. } => None,
+        }
+    }
 }
 
 /// R574-T4: watermark-staleness snapshot for RPO drift alerting, computed
@@ -411,11 +688,85 @@ impl BackupTarget {
         join_key(&self.prefix, "latest.stream-watermark")
     }
 
-    pub(crate) fn frame_key(&self, checkpoint_seq: u32, frame_no: u64) -> ObjPath {
-        join_key(
-            &self.prefix,
-            &format!("frames/{checkpoint_seq:010}/{frame_no:020}"),
-        )
+    /// R732-F2: frames are namespaced by the writer's fencing epoch, so two
+    /// owners at different epochs cannot land on the same key even if they
+    /// somehow both get as far as uploading. The epoch check in
+    /// [`tail_frames`] is the guard; this key shape is the backstop that makes
+    /// a guard failure recoverable (both owners' frames survive and the
+    /// manifests say who wrote what) instead of a silent overwrite.
+    ///
+    /// Epoch `0` keeps the original two-level layout. That is not cosmetic:
+    /// backups written before fencing existed are still restorable because
+    /// their manifests say `epoch 0` and land back on this branch.
+    ///
+    /// R761-F2: this is the *read-side legacy* key shape now — nothing writes
+    /// one-object-per-frame any more. See [`Self::frame_batch_key`].
+    pub(crate) fn frame_key(&self, epoch: u64, checkpoint_seq: u32, frame_no: u64) -> ObjPath {
+        let suffix = if epoch == 0 {
+            format!("frames/{checkpoint_seq:010}/{frame_no:020}")
+        } else {
+            format!("frames/{epoch:020}/{checkpoint_seq:010}/{frame_no:020}")
+        };
+        join_key(&self.prefix, &suffix)
+    }
+
+    /// R761-F2: key of a batch object holding frames `first..=last`
+    /// concatenated. Same epoch namespacing and zero-padding as
+    /// [`Self::frame_key`], so lexical order still matches frame order — one
+    /// stream's batches never overlap, because each is a slice of a single
+    /// monotonic drain.
+    ///
+    /// The range is in the key rather than only in the manifest so the sink
+    /// stays self-describing: a `ls` of the prefix tells an operator exactly
+    /// which frames are present, which is what made the per-frame layout easy
+    /// to reason about and is worth keeping.
+    ///
+    /// Distinguishable from a legacy per-frame key by construction (that one
+    /// has no `-`), so a stream that straddles the layout change can hold both
+    /// shapes under the same directory without collision.
+    pub(crate) fn frame_batch_key(
+        &self,
+        epoch: u64,
+        checkpoint_seq: u32,
+        first: u64,
+        last: u64,
+    ) -> ObjPath {
+        let suffix = if epoch == 0 {
+            format!("frames/{checkpoint_seq:010}/{first:020}-{last:020}")
+        } else {
+            format!("frames/{epoch:020}/{checkpoint_seq:010}/{first:020}-{last:020}")
+        };
+        join_key(&self.prefix, &suffix)
+    }
+
+    /// Every object holding generation `m`'s frames, as `(key, first, last)`
+    /// in ascending frame order.
+    ///
+    /// The single place that knows how a generation's frames are laid out:
+    /// R761-F2 batches when the manifest carries a `frame_batch` list, the
+    /// pre-R761-F2 one-object-per-frame layout when it does not. Restore's
+    /// replay and [`crate::puller::WalPuller`] both go through here, so the
+    /// two can never drift apart about where a frame lives.
+    pub(crate) fn frame_objects_of(
+        &self,
+        m: &OwnedGenerationManifest,
+    ) -> Vec<(ObjPath, u64, u64)> {
+        if m.frame_batches.is_empty() {
+            (m.first_frame..=m.last_frame)
+                .map(|n| (self.frame_key(m.epoch, m.checkpoint_seq, n), n, n))
+                .collect()
+        } else {
+            m.frame_batches
+                .iter()
+                .map(|&(first, last)| {
+                    (
+                        self.frame_batch_key(m.epoch, m.checkpoint_seq, first, last),
+                        first,
+                        last,
+                    )
+                })
+                .collect()
+        }
     }
 
     pub(crate) fn generation_key(&self, unix_nanos: u128) -> ObjPath {
@@ -437,12 +788,18 @@ impl BackupTarget {
 /// 3. If the seam's `checkpoint_seq` advanced, treat this as a restart:
 ///    upload frames `1..=max_frame` under the new sequence.
 /// 4. Otherwise upload frames `prior.last_frame+1..=max_frame`.
-/// 5. Write a generation manifest pointing at the base snapshot + frame
-///    range, then update the watermark sidecar. Manifest is written **last**
-///    so a manifest never references a missing frame.
+/// 5. Advance the watermark sidecar with a compare-and-swap on the version
+///    read in step 2, then write a generation manifest pointing at the base
+///    snapshot + frame range + the batch objects covering it. Frames precede
+///    both, so a manifest never references a missing frame; the manifest
+///    follows the CAS, so a writer that loses the sidecar race publishes
+///    nothing (R732-T3).
 ///
 /// Returns [`StreamOutcome::Empty`] if there is nothing to do (max_frame
-/// hasn't advanced and checkpoint_seq is unchanged).
+/// hasn't advanced and checkpoint_seq is unchanged), or
+/// [`StreamOutcome::Fenced`] if this writer's [`StreamConfig::epoch`] has been
+/// superseded — either observed up front in step 2 or discovered by losing the
+/// CAS in step 5.
 pub async fn tail_frames<S: WalSeam>(
     seam: &S,
     target: &BackupTarget,
@@ -456,7 +813,30 @@ pub async fn tail_frames<S: WalSeam>(
     // scheduler promises, this hovers at the invocation interval; a
     // skipped/late run pushes it past `rpo_target` and flips `breached`.
     let rpo = rpo_status(cfg.rpo_target, persisted.as_ref());
-    let prior = persisted.map(|p| p.watermark);
+
+    // R732-F2 (W245) / R736-T2 (W250): the two-level fence, checked before
+    // anything is written. A sink stamped with a higher epoch than ours means
+    // ownership moved within the cell while we were away; a sink stamped with
+    // a higher pointer generation means ownership moved to a *different*
+    // cell — the two raft groups don't share an epoch counter, so the epoch
+    // check alone is blind to that move. Either means every byte we are about
+    // to upload belongs to somebody else's stream. Bounce here and the call
+    // is a pure read; bounce anywhere later and we have already interleaved
+    // frames into the real owner's range.
+    if let Some(p) = &persisted {
+        if p.epoch > cfg.epoch || p.pointer_generation > cfg.pointer_generation {
+            return Ok(StreamOutcome::Fenced {
+                current_epoch: p.epoch,
+                our_epoch: cfg.epoch,
+                current_pointer_generation: p.pointer_generation,
+                our_pointer_generation: cfg.pointer_generation,
+            });
+        }
+    }
+
+    // Borrowed, not consumed: the conditional watermark advance at the end of
+    // this call needs the object version this read observed (R732-T3).
+    let prior = persisted.as_ref().map(|p| p.watermark);
 
     // Decide the range to upload.
     let (start_frame, restarted) = match prior {
@@ -477,6 +857,7 @@ pub async fn tail_frames<S: WalSeam>(
         seam,
         target,
         cfg,
+        cfg.epoch,
         current.checkpoint_seq,
         start_frame,
         current.last_frame,
@@ -496,9 +877,56 @@ pub async fn tail_frames<S: WalSeam>(
         });
     };
 
-    // Write the generation manifest, then update the watermark sidecar.
-    // Under a Shed policy that persisted a partial prefix, both cover only
-    // `start_frame..=uploaded_through`, not the full engine range.
+    // Claim the range with a conditional watermark advance, THEN publish the
+    // generation manifest. Under a Shed policy that persisted a partial
+    // prefix, both cover only `start_frame..=uploaded_through`, not the full
+    // engine range.
+    //
+    // R732-T3 reordered these two. The manifest used to be written last, so
+    // that a manifest never referenced a missing frame — that invariant is
+    // untouched, because frames still precede both. What the old order could
+    // not do is fence: a writer that lost the sidecar race had already
+    // published its manifest, which would then sit in the chain at a regressed
+    // epoch and make every future restore refuse. Publishing only after the
+    // CAS means a fenced writer leaves no manifest at all.
+    let cas = write_watermark(
+        &target.store,
+        &target.watermark_key(),
+        Watermark { checkpoint_seq: current.checkpoint_seq, last_frame: uploaded_through },
+        cfg.epoch,
+        cfg.pointer_generation,
+        persisted.as_ref().and_then(|p| p.version.as_ref()),
+    )
+    .await?;
+    if cas == WatermarkCas::Contended {
+        // Somebody replaced the sidecar under us. Re-read to learn who.
+        let now = read_watermark(&target.store, &target.watermark_key()).await?;
+        let current_epoch = now.as_ref().map_or(0, |p| p.epoch);
+        let current_pointer_generation = now.as_ref().map_or(0, |p| p.pointer_generation);
+        if current_epoch > cfg.epoch || current_pointer_generation > cfg.pointer_generation {
+            // A newer owner won the race. Our frames are orphaned under our
+            // own epoch prefix with no manifest naming them, so restore never
+            // sees them — the sink is exactly what the winner left.
+            return Ok(StreamOutcome::Fenced {
+                current_epoch,
+                our_epoch: cfg.epoch,
+                current_pointer_generation,
+                our_pointer_generation: cfg.pointer_generation,
+            });
+        }
+        // Same or lower epoch AND generation: neither fence can tell these two
+        // writers apart. That means two processes are streaming the same
+        // tenant under the SAME tokens — a caller bug (a duplicate streamer,
+        // or an ownership token handed out twice), and exactly the
+        // condition that must not be papered over with a retry.
+        anyhow::bail!(
+            "watermark CAS for {} lost to a concurrent writer at epoch {current_epoch} (pointer generation {current_pointer_generation}) while we hold epoch {} (pointer generation {}) — two streamers share one fencing token",
+            target.watermark_key(),
+            cfg.epoch,
+            cfg.pointer_generation,
+        );
+    }
+
     let nanos = unix_nanos();
     let gen_key = target.generation_key(nanos);
     let manifest = format_generation_manifest(GenerationManifest {
@@ -507,18 +935,18 @@ pub async fn tail_frames<S: WalSeam>(
         checkpoint_seq: current.checkpoint_seq,
         first_frame: start_frame,
         last_frame: uploaded_through,
+        epoch: cfg.epoch,
+        owner: cfg.owner,
+        // R761-F2: exactly the batch objects the drain persisted. Restore
+        // derives its keys from this list, so it is not a summary of the range
+        // — it IS the range's index.
+        frame_batches: &drain.frame_batches,
     });
     target
         .store
         .put(&gen_key, manifest.into_bytes().into())
         .await
         .with_context(|| format!("writing generation manifest {gen_key}"))?;
-    write_watermark(
-        &target.store,
-        &target.watermark_key(),
-        Watermark { checkpoint_seq: current.checkpoint_seq, last_frame: uploaded_through },
-    )
-    .await?;
 
     let frame_count = uploaded_through - start_frame + 1;
     let gen_key = gen_key.to_string();
@@ -551,17 +979,24 @@ pub async fn tail_frames<S: WalSeam>(
 /// shed before any of them landed) plus the backpressure activity report.
 struct DrainOutcome {
     uploaded_through: Option<u64>,
+    /// R761-F2: the `(first, last)` range of every batch object that actually
+    /// landed, ascending and gap-free from the call's `start_frame` through
+    /// `uploaded_through` (a batch is popped only on a successful upload, so a
+    /// partial drain truncates this list rather than holing it). Copied into
+    /// the generation manifest, which is what tells restore where to look.
+    frame_batches: Vec<(u64, u64)>,
     report: BackpressureReport,
 }
 
 /// Read WAL frames `start_frame..=last_frame` into a bounded spill buffer
 /// (`cfg.backpressure.spill_buffer_frames`) and drain them to `target`'s
-/// object store one at a time through [`put_with_backoff`] (R574-F2).
+/// object store through [`put_with_backoff`] (R574-F2), one **batch object**
+/// per buffer-full (R761-F2).
 ///
 /// The buffer only refills up to its bound, so once full the loop must
-/// resolve the head frame — either by a successful upload or by the
+/// resolve the buffered batch — either by a successful upload or by the
 /// configured [`BackpressurePolicy`] deciding what "stuck" means:
-/// `Block` retries the head forever on a throttling error (no data loss,
+/// `Block` retries the batch forever on a throttling error (no data loss,
 /// but the call can run long); `Fail` bubbles the error once
 /// `backoff.max_retries` is exhausted (nothing persists past what already
 /// landed); `Shed` drops the whole buffered backlog (loudly, via the
@@ -569,10 +1004,18 @@ struct DrainOutcome {
 /// non-throttling error bubbles immediately regardless of policy — this
 /// mechanism is specifically for R2 throttling, not general fault
 /// tolerance.
+///
+/// R761-F2 made the upload unit the buffer's contents rather than its head
+/// frame, which is why `spill_buffer_frames` also sizes the largest object
+/// this sink will write: `spill_buffer_frames * (24 + page_size)` bytes, ~1 MB
+/// at the 256-frame default and a 4 KB page. That coupling is deliberate — the
+/// bound already promises a memory ceiling, and a second knob for batch size
+/// would only ever be set to some fraction of it.
 async fn drain_frames_with_backpressure<S: WalSeam>(
     seam: &S,
     target: &BackupTarget,
     cfg: &StreamConfig<'_>,
+    epoch: u64,
     checkpoint_seq: u32,
     start_frame: u64,
     last_frame: u64,
@@ -584,12 +1027,13 @@ async fn drain_frames_with_backpressure<S: WalSeam>(
     let mut report = BackpressureReport { policy: bp.policy, ..Default::default() };
     let mut pending: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
     let mut uploaded_through: Option<u64> = None;
+    let mut frame_batches: Vec<(u64, u64)> = Vec::new();
     let mut next_to_read = start_frame;
     let mut buf = vec![0u8; frame_size];
 
     loop {
         // Refill up to the bound while there's more WAL to read. Once full,
-        // the head frame must be resolved before we accept more.
+        // the buffered batch must be resolved before we accept more.
         while pending.len() < bound && next_to_read <= last_frame {
             seam.wal_get_frame(next_to_read, &mut buf)
                 .with_context(|| format!("reading wal frame {next_to_read}"))?;
@@ -597,30 +1041,39 @@ async fn drain_frames_with_backpressure<S: WalSeam>(
             next_to_read += 1;
             report.high_water_frames = report.high_water_frames.max(pending.len());
         }
-        let Some((frame_no, bytes)) = pending.front().cloned() else {
+        let Some(&(first, _)) = pending.front() else {
             break; // Fully drained: nothing buffered, nothing left to read.
         };
-        let key = target.frame_key(checkpoint_seq, frame_no);
-        match put_with_backoff(&target.store, &key, bytes.into(), bp, &mut report.throttle_retries)
+        // Non-empty (we just matched `front`), and the buffer is filled in
+        // ascending order without gaps, so the back frame closes the range.
+        let last = pending.back().map_or(first, |&(n, _)| n);
+        let mut body = Vec::with_capacity(pending.len() * frame_size);
+        for (_, bytes) in &pending {
+            body.extend_from_slice(bytes);
+        }
+        let key = target.frame_batch_key(epoch, checkpoint_seq, first, last);
+        match put_with_backoff(&target.store, &key, body.into(), bp, &mut report.throttle_retries)
             .await
         {
             Ok(_) => {
-                pending.pop_front();
-                uploaded_through = Some(frame_no);
+                pending.clear();
+                uploaded_through = Some(last);
+                frame_batches.push((first, last));
             }
             Err(e) => match bp.policy {
                 BackpressurePolicy::Shed => {
                     report.frames_shed += pending.len() as u64;
-                    return Ok(DrainOutcome { uploaded_through, report });
+                    return Ok(DrainOutcome { uploaded_through, frame_batches, report });
                 }
                 BackpressurePolicy::Block | BackpressurePolicy::Fail => {
-                    return Err(e)
-                        .with_context(|| format!("uploading wal frame {frame_no} to {key}"));
+                    return Err(e).with_context(|| {
+                        format!("uploading wal frames {first}-{last} to {key}")
+                    });
                 }
             },
         }
     }
-    Ok(DrainOutcome { uploaded_through, report })
+    Ok(DrainOutcome { uploaded_through, frame_batches, report })
 }
 
 /// Take a raw, point-in-time-consistent byte image of the database at `db_path`
@@ -755,6 +1208,11 @@ pub struct RestoreOutcome {
     pub frames_replayed: u64,
     /// The last frame position written into the destination WAL.
     pub last_frame: u64,
+    /// R732-F2: the highest fencing epoch contributing to this restore (`0`
+    /// for a chain written before fencing existed). Reported so an operator
+    /// restoring after an ownership transfer can see which owner's data they
+    /// actually got.
+    pub epoch: u64,
 }
 
 /// A consistency-checked sequence of generation manifests, ready to drive a
@@ -766,6 +1224,12 @@ pub(crate) struct ValidatedChain {
     pub page_size: usize,
     pub checkpoint_seq: u32,
     pub total_frames: u64,
+    /// R732-F2: the highest fencing epoch in the chain — i.e. the most recent
+    /// owner that contributed frames. Unlike the other fields this is a
+    /// *maximum*, not a shared constant: ownership legitimately moves
+    /// mid-chain, so a chain may span epochs as long as they never go
+    /// backwards.
+    pub epoch: u64,
 }
 
 /// Validate that a sorted list of generation manifests forms a single,
@@ -784,7 +1248,22 @@ pub(crate) fn validate_generation_chain(
         .first()
         .context("validate_generation_chain: empty manifest list")?;
     let mut expected_next_frame: u64 = 1;
+    let mut chain_epoch: u64 = 0;
     for (i, m) in manifests.iter().enumerate() {
+        // R732-F2 (W245): generations are ordered by write time, so a chain
+        // whose epoch goes BACKWARDS says a stale owner wrote after the sink
+        // had already moved on — precisely the split-brain the fence exists to
+        // stop, caught here on the read side too. Non-decreasing is fine and
+        // expected: ownership transfers mid-stream and the new owner keeps
+        // appending frames to the same contiguous range.
+        if m.epoch < chain_epoch {
+            anyhow::bail!(
+                "generation #{i} was written at epoch {} but an earlier generation in the chain is at epoch {} — a fenced (stale) owner wrote to this sink, restore refuses rather than replay interleaved frames",
+                m.epoch,
+                chain_epoch,
+            );
+        }
+        chain_epoch = m.epoch;
         if m.base_snapshot_key != first.base_snapshot_key {
             anyhow::bail!(
                 "generation #{i} references base {:?}, expected {:?} — chain spans bases, restore needs a fresh tier-1a snapshot",
@@ -827,42 +1306,84 @@ pub(crate) fn validate_generation_chain(
         page_size: first.page_size,
         checkpoint_seq: first.checkpoint_seq,
         total_frames: expected_next_frame - 1,
+        epoch: chain_epoch,
     })
+}
+
+/// Fetch one generation's frames and hand each to `on_frame` in ascending
+/// frame order, skipping anything before `from_frame`. Returns how many frames
+/// were delivered.
+///
+/// R761-F2: the one read path that resolves a manifest to frame bytes,
+/// batched or not — [`BackupTarget::frame_objects_of`] decides which layout
+/// the generation used, and a batch object is split here at
+/// `24 + page_size` boundaries. Both restore's replay and
+/// [`crate::puller::WalPuller`] call it, so a layout the writer can produce
+/// can never be readable by one and not the other.
+pub(crate) async fn for_each_frame_in_generation<F>(
+    target: &BackupTarget,
+    m: &OwnedGenerationManifest,
+    from_frame: u64,
+    mut on_frame: F,
+) -> Result<u64>
+where
+    F: FnMut(u64, &[u8]) -> Result<()>,
+{
+    let frame_size = WAL_FRAME_HEADER_SIZE + m.page_size;
+    let mut delivered: u64 = 0;
+    for (key, first, last) in target.frame_objects_of(m) {
+        if last < from_frame {
+            continue; // wholly behind the caller's cursor — don't pay for the GET
+        }
+        let bytes = target
+            .store
+            .get(&key)
+            .await
+            .with_context(|| format!("fetching frame object {key}"))?
+            .bytes()
+            .await
+            .with_context(|| format!("reading frame object body {key}"))?;
+        let frames_in_object = (last - first + 1) as usize;
+        let want = frames_in_object * frame_size;
+        if bytes.len() != want {
+            anyhow::bail!(
+                "frame object {key} is {} bytes, expected {want} ({frames_in_object} frame(s) x [{WAL_FRAME_HEADER_SIZE} header + {} page])",
+                bytes.len(),
+                m.page_size,
+            );
+        }
+        for (i, frame_no) in (first..=last).enumerate() {
+            if frame_no < from_frame {
+                continue;
+            }
+            let at = i * frame_size;
+            on_frame(frame_no, &bytes[at..at + frame_size])?;
+            delivered += 1;
+        }
+    }
+    Ok(delivered)
 }
 
 /// Replay every frame named by `manifests` into `seam`, in (checkpoint_seq,
 /// frame_no) order. Caller must have already called `wal_insert_begin` on the
 /// seam; `wal_insert_end` is also the caller's responsibility (so a test or a
 /// future fault-injection path can choose `force_commit`).
+///
+/// Each manifest's own `page_size` sizes its frames —
+/// [`validate_generation_chain`] has already established they all agree, so
+/// there is no separate chain-level page size to thread through.
 async fn replay_frames_into<S: WalInsertSeam>(
     target: &BackupTarget,
     seam: &S,
     manifests: &[OwnedGenerationManifest],
-    page_size: usize,
 ) -> Result<u64> {
-    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
     let mut total: u64 = 0;
     for m in manifests {
-        for frame_no in m.first_frame..=m.last_frame {
-            let key = target.frame_key(m.checkpoint_seq, frame_no);
-            let bytes = target
-                .store
-                .get(&key)
-                .await
-                .with_context(|| format!("fetching frame {key}"))?
-                .bytes()
-                .await
-                .with_context(|| format!("reading frame body {key}"))?;
-            if bytes.len() != frame_size {
-                anyhow::bail!(
-                    "frame {key} is {} bytes, expected {frame_size} (24 header + {page_size} page)",
-                    bytes.len(),
-                );
-            }
-            seam.wal_insert_frame(frame_no, &bytes)
-                .with_context(|| format!("inserting frame {frame_no} (key {key})"))?;
-            total += 1;
-        }
+        total += for_each_frame_in_generation(target, m, 0, |frame_no, bytes| {
+            seam.wal_insert_frame(frame_no, bytes)
+                .with_context(|| format!("inserting frame {frame_no}"))
+        })
+        .await?;
     }
     Ok(total)
 }
@@ -884,18 +1405,48 @@ async fn replay_frames_into<S: WalInsertSeam>(
 /// `dest_path`'s `-wal` and `-shm` sidecars are removed before the base is
 /// written; any pre-existing turso connection on `dest_path` must be closed
 /// by the caller.
+///
+/// A caller that has already listed the chain for its own reasons should call
+/// [`restore_stream_from_manifests`] instead and skip the re-listing this one
+/// does — see its docs for what that costs (R760-T18).
 pub async fn restore_latest_stream(
     target: &BackupTarget,
     dest_path: &str,
 ) -> Result<RestoreOutcome> {
     let manifests = list_and_parse_generation_manifests(target).await?;
+    restore_stream_from_manifests(target, dest_path, &manifests).await
+}
+
+/// [`restore_latest_stream`] for a caller that has already listed and parsed
+/// the chain — same replay, minus the listing.
+///
+/// R760-T18: a caller that must inspect the chain *before* deciding how to
+/// restore otherwise pays for every manifest twice. roadcase's `SinkHydrator`
+/// is the live example: it calls [`list_and_parse_generation_manifests`] to
+/// ask whether the era has any frames at all (an era whose base is still the
+/// whole story restores via `snapshot::restore_latest` instead), and then
+/// `restore_latest_stream` re-listed and re-fetched the identical objects. A
+/// cold start with `n` generations was measured at `3n+1` Class B operations
+/// against a `2n+1` floor — one GET per manifest, one per generation's frame
+/// batch, one for the base. Handing the parse straight in removes the `n`
+/// duplicates.
+///
+/// `manifests` must be ascending by generation, which is the order
+/// [`list_and_parse_generation_manifests`] returns them in; the chain is
+/// validated here exactly as it is on the listing path, so a hand-assembled
+/// list cannot smuggle past a check.
+pub async fn restore_stream_from_manifests(
+    target: &BackupTarget,
+    dest_path: &str,
+    manifests: &[OwnedGenerationManifest],
+) -> Result<RestoreOutcome> {
     if manifests.is_empty() {
         anyhow::bail!(
             "no generation manifests under {} — restore tier-1a directly via snapshot::restore_latest",
             join_key(&target.prefix, "generations"),
         );
     }
-    let chain = validate_generation_chain(&manifests)?;
+    let chain = validate_generation_chain(manifests)?;
 
     // Download the base snapshot and lay it down at dest_path. Strip any stale
     // WAL/-shm sidecars first — the base alone is the entire pre-replay image
@@ -920,7 +1471,7 @@ pub async fn restore_latest_stream(
     let seam = CoreWalSeam::open(dest_path)?;
     seam.wal_insert_begin()
         .context("starting WAL insert session on restore destination")?;
-    let frames = match replay_frames_into(target, &seam, &manifests, chain.page_size).await {
+    let frames = match replay_frames_into(target, &seam, manifests).await {
         Ok(n) => n,
         Err(e) => {
             // Best-effort: roll the partial replay back so we never leave the
@@ -941,10 +1492,28 @@ pub async fn restore_latest_stream(
         generation_count: manifests.len(),
         frames_replayed: frames,
         last_frame: chain.total_frames,
+        epoch: chain.epoch,
     })
 }
 
-pub(crate) async fn list_and_parse_generation_manifests(
+/// Every generation manifest at a sink, in key (i.e. chronological) order.
+///
+/// **The GETs are serialized**, one manifest at a time, and so is the frame
+/// replay in [`for_each_frame_in_generation`] — so a restore's wall clock is
+/// `(2n+1) x RTT` plus transfer for `n` generations, not `max(RTT)`. That is
+/// fine at the tens of generations a dedicated streamer accumulates between
+/// checkpoints and is not fine at thousands; R760-T18 bounds it on the
+/// *writer* side (roadcase caps generations per era) rather than by making
+/// this concurrent, because concurrency here would mean a real
+/// `futures`/`tokio::spawn` dependency in a crate that deliberately keeps
+/// `futures_util` to `[dev-dependencies]`.
+///
+/// Public since R732-T5: a split-brain reconciliation oracle needs to ask what
+/// a sink would actually replay — which owner wrote which frame range, under
+/// which epoch — without running a full restore. Pair it with
+/// [`validate_generation_chain`]'s public counterpart if you need the chain
+/// checked rather than merely listed.
+pub async fn list_and_parse_generation_manifests(
     target: &BackupTarget,
 ) -> Result<Vec<OwnedGenerationManifest>> {
     let prefix = join_key(&target.prefix, "generations");
@@ -975,16 +1544,26 @@ pub(crate) async fn list_and_parse_generation_manifests(
 /// In-memory shape of a generation manifest. Format on disk:
 ///
 /// ```text
-/// TURSO-BACKUP STREAM v1
+/// TURSO-BACKUP STREAM v3
 /// base_snapshot <key>
 /// page_size <n>
 /// checkpoint_seq <n>
 /// first_frame <n>
 /// last_frame <n>
+/// epoch <n>
+/// owner <label>        (optional)
+/// frame_batch <first>-<last>   (one per batch object, ascending, gap-free)
 /// ```
 ///
 /// Text, dependency-free (no serde), one field per line. Mirrors the
 /// `dedup::Manifest` convention so the crate stays consistent.
+///
+/// R732-F2 added `epoch`/`owner` and moved the header to `v2`. R761-F2 added
+/// the `frame_batch` list and moved it to `v3`. Older manifests still parse —
+/// `v1` with `epoch = 0`, `owner = None`; `v1`/`v2` with no batch list, which
+/// is what marks their frames as living one-per-object — so backups written
+/// before either change stay restorable. Neither older version is ever
+/// written any more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationManifest<'a> {
     pub base_snapshot_key: &'a str,
@@ -992,13 +1571,68 @@ pub struct GenerationManifest<'a> {
     pub checkpoint_seq: u32,
     pub first_frame: u64,
     pub last_frame: u64,
+    /// R732-F2: the fencing epoch this generation was written under. `0` means
+    /// it predates fencing (a `v1` manifest), which is also the key shape its
+    /// frames live under — see [`BackupTarget::frame_key`].
+    pub epoch: u64,
+    /// R732-F2: opaque owner label, diagnostic only. See [`StreamConfig::owner`].
+    pub owner: Option<&'a str>,
+    /// R761-F2: the `(first, last)` frame range of each batch object holding
+    /// this generation's frames, ascending and exactly tiling
+    /// `first_frame..=last_frame`. Empty means the pre-batching layout (one
+    /// object per frame); a writer emits it empty only when re-formatting a
+    /// legacy manifest.
+    pub frame_batches: &'a [(u64, u64)],
 }
 
+/// Header of a manifest written by a fencing-aware writer (R732-F2). The
+/// version is bumped rather than the `epoch` key just being added, because
+/// [`parse_generation_manifest`] rejects unknown keys: a pre-R732 binary
+/// reading a fenced manifest would otherwise fail with `unknown manifest key:
+/// epoch`, which reads like corruption. Failing on the *header* says the real
+/// thing — this backup was written by a newer writer.
+const MANIFEST_HEADER_V2: &str = "TURSO-BACKUP STREAM v2";
+/// Pre-fencing header. Still accepted on read (those backups must stay
+/// restorable) and parses with `epoch = 0`, `owner = None`; never written.
+const MANIFEST_HEADER_V1: &str = "TURSO-BACKUP STREAM v1";
+/// R761-F2 — carries the `frame_batch` list. Bumped for the same reason
+/// `v2` was: [`parse_generation_manifest`] rejects unknown keys, so a
+/// pre-R761-F2 binary reading a batched manifest would fail with `unknown
+/// manifest key: frame_batch`, which reads like corruption. Failing on the
+/// header says the true thing — a newer writer wrote this sink. The refusal
+/// matters more here than it did for fencing: an older reader that somehow
+/// skipped the batch list would look for per-frame keys that do not exist.
+const MANIFEST_HEADER_V3: &str = "TURSO-BACKUP STREAM v3";
+
 pub(crate) fn format_generation_manifest(m: GenerationManifest<'_>) -> String {
-    format!(
-        "TURSO-BACKUP STREAM v1\nbase_snapshot {}\npage_size {}\ncheckpoint_seq {}\nfirst_frame {}\nlast_frame {}\n",
-        m.base_snapshot_key, m.page_size, m.checkpoint_seq, m.first_frame, m.last_frame,
-    )
+    // A manifest with no batch list describes the pre-R761-F2 layout, and
+    // stamping v3 on it would promise a list that isn't there. The only way to
+    // reach this is re-formatting a legacy manifest (a test, or a repair
+    // tool); tail_frames always has batches.
+    let header = if m.frame_batches.is_empty() {
+        MANIFEST_HEADER_V2
+    } else {
+        MANIFEST_HEADER_V3
+    };
+    let mut out = format!(
+        "{}\nbase_snapshot {}\npage_size {}\ncheckpoint_seq {}\nfirst_frame {}\nlast_frame {}\nepoch {}\n",
+        header,
+        m.base_snapshot_key,
+        m.page_size,
+        m.checkpoint_seq,
+        m.first_frame,
+        m.last_frame,
+        m.epoch,
+    );
+    // Omitted rather than written empty: the parser splits on the first space,
+    // so `owner ` with no value would round-trip to `Some("")`.
+    if let Some(owner) = m.owner {
+        out.push_str(&format!("owner {owner}\n"));
+    }
+    for (first, last) in m.frame_batches {
+        out.push_str(&format!("frame_batch {first}-{last}\n"));
+    }
+    out
 }
 
 /// Parse a generation manifest. Tolerant to trailing whitespace; rejects any
@@ -1011,19 +1645,36 @@ pub struct OwnedGenerationManifest {
     pub checkpoint_seq: u32,
     pub first_frame: u64,
     pub last_frame: u64,
+    /// R732-F2: `0` for a `v1` (pre-fencing) manifest.
+    pub epoch: u64,
+    /// R732-F2: diagnostic only; `None` when the writer did not label itself.
+    pub owner: Option<String>,
+    /// R761-F2: the batch objects covering `first_frame..=last_frame`,
+    /// ascending and gap-free (enforced by [`parse_generation_manifest`]).
+    /// **Empty means the pre-batching layout** — one object per frame — which
+    /// is how a `v1`/`v2` manifest keeps restoring. Resolve it to keys with
+    /// `BackupTarget::frame_objects_of` (crate-private) rather than branching
+    /// at each call site.
+    pub frame_batches: Vec<(u64, u64)>,
 }
 
 pub fn parse_generation_manifest(text: &str) -> Result<OwnedGenerationManifest> {
     let mut lines = text.lines();
-    let header = lines.next().context("empty generation manifest")?;
-    if header.trim() != "TURSO-BACKUP STREAM v1" {
-        anyhow::bail!("unexpected manifest header: {header:?}");
-    }
+    let header = lines.next().context("empty generation manifest")?.trim();
+    let (v2, v3) = match header {
+        MANIFEST_HEADER_V3 => (true, true),
+        MANIFEST_HEADER_V2 => (true, false),
+        MANIFEST_HEADER_V1 => (false, false),
+        other => anyhow::bail!("unexpected manifest header: {other:?}"),
+    };
     let mut base_snapshot_key: Option<String> = None;
     let mut page_size: Option<usize> = None;
     let mut checkpoint_seq: Option<u32> = None;
     let mut first_frame: Option<u64> = None;
     let mut last_frame: Option<u64> = None;
+    let mut epoch: Option<u64> = None;
+    let mut owner: Option<String> = None;
+    let mut frame_batches: Vec<(u64, u64)> = Vec::new();
     for line in lines {
         let line = line.trim();
         if line.is_empty() {
@@ -1038,15 +1689,65 @@ pub fn parse_generation_manifest(text: &str) -> Result<OwnedGenerationManifest> 
             "checkpoint_seq" => checkpoint_seq = Some(v.parse().context("checkpoint_seq")?),
             "first_frame" => first_frame = Some(v.parse().context("first_frame")?),
             "last_frame" => last_frame = Some(v.parse().context("last_frame")?),
+            "epoch" => epoch = Some(v.parse().context("epoch")?),
+            "owner" => owner = Some(v.to_string()),
+            "frame_batch" => {
+                let (first, last) = v
+                    .split_once('-')
+                    .with_context(|| format!("malformed frame_batch range: {v:?}"))?;
+                frame_batches.push((
+                    first.trim().parse().context("frame_batch first")?,
+                    last.trim().parse().context("frame_batch last")?,
+                ));
+            }
             other => anyhow::bail!("unknown manifest key: {other}"),
         }
+    }
+    // A v2 manifest without an epoch is corrupt, not legacy — the writer that
+    // stamped the v2 header always writes one. Defaulting it to 0 would
+    // silently demote a fenced generation to unfenced, which is the one
+    // direction this whole mechanism must never fail in.
+    if v2 && epoch.is_none() {
+        anyhow::bail!("{MANIFEST_HEADER_V2} manifest is missing `epoch`");
+    }
+    let first_frame = first_frame.context("missing first_frame")?;
+    let last_frame = last_frame.context("missing last_frame")?;
+    // R761-F2: the batch list IS the frame index, so a v3 manifest that does
+    // not tile its own range exactly would send restore looking for objects
+    // that were never written — caught here, at parse, rather than as a 404
+    // halfway through a replay.
+    if v3 {
+        anyhow::ensure!(
+            !frame_batches.is_empty(),
+            "{MANIFEST_HEADER_V3} manifest has no `frame_batch` lines — it cannot say where its frames are"
+        );
+        let mut expected = first_frame;
+        for &(first, last) in &frame_batches {
+            anyhow::ensure!(
+                first == expected && last >= first,
+                "frame_batch {first}-{last} does not continue the range at frame {expected}"
+            );
+            expected = last + 1;
+        }
+        anyhow::ensure!(
+            expected == last_frame + 1,
+            "frame_batch list covers frames {first_frame}..={} but the manifest claims {first_frame}..={last_frame}",
+            expected - 1,
+        );
+    } else if !frame_batches.is_empty() {
+        anyhow::bail!(
+            "manifest header {header:?} carries `frame_batch` lines — batching is a {MANIFEST_HEADER_V3} feature, so this manifest is corrupt or hand-edited"
+        );
     }
     Ok(OwnedGenerationManifest {
         base_snapshot_key: base_snapshot_key.context("missing base_snapshot")?,
         page_size: page_size.context("missing page_size")?,
         checkpoint_seq: checkpoint_seq.context("missing checkpoint_seq")?,
-        first_frame: first_frame.context("missing first_frame")?,
-        last_frame: last_frame.context("missing last_frame")?,
+        first_frame,
+        last_frame,
+        epoch: epoch.unwrap_or(0),
+        owner,
+        frame_batches,
     })
 }
 
@@ -1054,22 +1755,60 @@ pub fn parse_generation_manifest(text: &str) -> Result<OwnedGenerationManifest> 
 /// wall-clock instant the sidecar was last written (R574-T4 — this is what
 /// [`RpoStatus::watermark_age`] measures against). `written_at_nanos` is
 /// `None` for sidecars written before the timestamp field existed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedWatermark {
     watermark: Watermark,
     written_at_nanos: Option<u128>,
+    /// R732-F2: the fencing epoch of the writer that last advanced this
+    /// sidecar. `0` for a sidecar written before the field existed, which
+    /// reads as "unfenced" and therefore fences nobody — the same
+    /// behaviour-preserving default as [`StreamConfig::epoch`].
+    ///
+    /// This is the value [`tail_frames`] compares against, so it is the single
+    /// piece of state the whole fence rests on. R732-T3 makes advancing it a
+    /// compare-and-swap (R732-T3), so the *concurrent* hole is closed too:
+    /// two writers racing the read-modify-write cannot both win, because the
+    /// loser's conditional put fails against the version the winner replaced.
+    epoch: u64,
+    /// R736-T2: the pointer generation of the writer that last advanced this
+    /// sidecar. `0` for a sidecar written before the field existed, which
+    /// reads as "unfenced" and therefore fences nobody — the same
+    /// behaviour-preserving default as [`StreamConfig::pointer_generation`].
+    /// Checked alongside `epoch` in [`tail_frames`]; either being stale
+    /// bounces the writer.
+    pointer_generation: u64,
+    /// R732-T3: the object version this record was read at, carried so the
+    /// next advance can be conditional on it. `None` only when the sidecar
+    /// does not exist yet, which selects [`PutMode::Create`] instead of
+    /// [`PutMode::Update`] — "I believe nobody owns this sink" is as much a
+    /// precondition as "I believe it is still at version V".
+    version: Option<UpdateVersion>,
 }
 
-/// Sidecar format: `<checkpoint_seq> <last_frame> [<written_at_unix_nanos>]`.
-/// The third field was added by R574-T4; a two-field sidecar (pre-T4 writer)
-/// still parses, with `written_at_nanos = None` — the RPO age is simply
-/// unknown until the next write stamps it.
+/// Sidecar format:
+/// `<checkpoint_seq> <last_frame> [<written_at_unix_nanos> [<epoch> [<pointer_generation>]]]`.
+///
+/// The third field was added by R574-T4, the fourth by R732-F2, and the fifth
+/// by R736-T2; all are positional appends, which is what keeps this readable
+/// in both directions. A two-, three-, or four-field sidecar (older writer)
+/// still parses, with the missing tail defaulting to `None` / `0`, and an
+/// older reader stops after its last known field and never sees the newer
+/// ones. Fields are only ever appended for exactly that reason — do not
+/// reorder them.
 async fn read_watermark(
     store: &Arc<dyn ObjectStore>,
     key: &ObjPath,
 ) -> Result<Option<PersistedWatermark>> {
     match store.get(key).await {
         Ok(res) => {
+            // Capture the version BEFORE consuming the body — `bytes()` takes
+            // `res` by value. Both fields are kept because stores differ in
+            // which one they honour for a conditional put (object_store's own
+            // `UpdateVersion` docs say to preserve both).
+            let version = UpdateVersion {
+                e_tag: res.meta.e_tag.clone(),
+                version: res.meta.version.clone(),
+            };
             let bytes = res.bytes().await.context("reading watermark sidecar")?;
             let s = String::from_utf8_lossy(&bytes);
             let mut fields = s.split_whitespace();
@@ -1083,12 +1822,25 @@ async fn read_watermark(
                 .next()
                 .map(|n| n.parse::<u128>().context("watermark written_at nanos"))
                 .transpose()?;
+            let epoch = fields
+                .next()
+                .map(|e| e.parse::<u64>().context("watermark epoch"))
+                .transpose()?
+                .unwrap_or(0);
+            let pointer_generation = fields
+                .next()
+                .map(|g| g.parse::<u64>().context("watermark pointer_generation"))
+                .transpose()?
+                .unwrap_or(0);
             Ok(Some(PersistedWatermark {
                 watermark: Watermark {
                     checkpoint_seq: seq.parse().context("watermark checkpoint_seq")?,
                     last_frame: frame.parse().context("watermark last_frame")?,
                 },
                 written_at_nanos,
+                epoch,
+                pointer_generation,
+                version: Some(version),
             }))
         }
         Err(object_store::Error::NotFound { .. }) => Ok(None),
@@ -1096,17 +1848,218 @@ async fn read_watermark(
     }
 }
 
+/// R732-T3: result of a conditional watermark advance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatermarkCas {
+    /// We held the version we read, and the sidecar now names us.
+    Advanced,
+    /// Somebody else replaced the sidecar between our read and our write.
+    /// Says nothing about *who* — the caller re-reads to find out whether it
+    /// was a newer owner (we are fenced) or a same-epoch racer (a bug).
+    Contended,
+}
+
+/// Advance the watermark sidecar **conditionally** on the version it was read
+/// at (R732-T3 / W245).
+///
+/// This is the atomic half of the fence. The epoch check in [`tail_frames`]
+/// stops a *sequential* stale owner — one that returns after a transfer and
+/// reads a sidecar already stamped higher. It cannot stop a *concurrent* one:
+/// two writers that both read the old sidecar in the same instant would both
+/// pass that check and then both blindly overwrite, last write winning, which
+/// is exactly the corruption W245 describes. Making the advance a
+/// compare-and-swap removes the window — at most one of them holds the version
+/// the other replaced.
+///
+/// No new CAS primitive was needed: `object_store` already models this as
+/// [`PutMode::Update`] (→ [`object_store::Error::Precondition`]) and
+/// [`PutMode::Create`] (→ `AlreadyExists`) for the first write, and R2 honours
+/// the underlying `If-Match` / `If-None-Match`.
+///
+/// **Deployment caveat, not a code path:** `AmazonS3Builder` must be
+/// configured for conditional puts against a store that supports them. If the
+/// backend silently degrades to unconditional writes, this returns `Advanced`
+/// unconditionally and the concurrent window reopens — the sequential fence in
+/// `tail_frames` still holds, but the race does not.
 async fn write_watermark(
     store: &Arc<dyn ObjectStore>,
     key: &ObjPath,
     w: Watermark,
-) -> Result<()> {
-    let body = format!("{} {} {}\n", w.checkpoint_seq, w.last_frame, unix_nanos());
-    store
-        .put(key, body.into_bytes().into())
+    epoch: u64,
+    pointer_generation: u64,
+    expected: Option<&UpdateVersion>,
+) -> Result<WatermarkCas> {
+    let body = format!(
+        "{} {} {} {} {}\n",
+        w.checkpoint_seq,
+        w.last_frame,
+        unix_nanos(),
+        epoch,
+        pointer_generation
+    );
+    let opts = PutOptions {
+        mode: match expected {
+            Some(v) => PutMode::Update(v.clone()),
+            // No sidecar when we read: assert that is *still* true, so two
+            // writers bootstrapping the same fresh sink cannot both proceed.
+            None => PutMode::Create,
+        },
+        ..Default::default()
+    };
+    match store.put_opts(key, body.into_bytes().into(), opts).await {
+        Ok(_) => Ok(WatermarkCas::Advanced),
+        Err(object_store::Error::Precondition { .. })
+        | Err(object_store::Error::AlreadyExists { .. }) => Ok(WatermarkCas::Contended),
+        Err(e) => Err(e).with_context(|| format!("writing watermark sidecar {key}")),
+    }
+}
+
+/// Which conditional-put mode a preflight probe found unenforced.
+///
+/// Both matter and they fail independently — a store can honour `If-None-Match`
+/// (guarding the bootstrap put) while ignoring `If-Match` (guarding every
+/// steady-state advance), or the reverse. Naming which one degraded is the
+/// difference between an operator fixing a bucket setting in a minute and
+/// bisecting a corruption in a week.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreflightStage {
+    /// [`PutMode::Create`] / `If-None-Match` — the guard on two writers
+    /// bootstrapping the same fresh sink.
+    Create,
+    /// [`PutMode::Update`] / `If-Match` — the guard on every subsequent
+    /// watermark advance, and therefore the one the steady state rests on.
+    Update,
+}
+
+impl PreflightStage {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PreflightStage::Create => "PutMode::Create (If-None-Match)",
+            PreflightStage::Update => "PutMode::Update (If-Match)",
+        }
+    }
+}
+
+/// What [`probe_conditional_puts`] observed at a real sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreconditionSupport {
+    /// Both conditional modes were enforced — a put that should have been
+    /// rejected was rejected. The watermark CAS is real at this sink.
+    Honoured,
+    /// A put that *must* have failed its precondition succeeded instead, so
+    /// this backend has silently degraded to unconditional writes.
+    Degraded { stage: PreflightStage },
+}
+
+impl PreconditionSupport {
+    pub fn is_honoured(&self) -> bool {
+        matches!(self, PreconditionSupport::Honoured)
+    }
+}
+
+/// R732-T4: prove, against the *real* configured sink, that conditional puts
+/// are actually enforced — and hand the caller a hard answer so it can refuse
+/// to start when they are not.
+///
+/// [`write_watermark`] carries a deployment caveat that no test can close:
+/// if `AmazonS3Builder` is pointed at a store that does not honour
+/// `If-Match` / `If-None-Match`, every conditional put silently succeeds, the
+/// CAS degrades to last-write-wins, and the concurrent split-brain window
+/// W245 exists to shut reopens — while every unit test stays green, because
+/// the in-memory store used in tests does honour them. Support is a property
+/// of configuration, not of code, so a runtime probe is the only guard that
+/// can exist.
+///
+/// The probe writes a uniquely-keyed canary under `<prefix>/preflight/`,
+/// exercises both modes with puts that MUST be rejected, and deletes it. It
+/// touches no watermark, no manifest and no frame, so it is safe to run at
+/// startup against a live sink another node owns — and it is deliberately
+/// keyed per-process-per-nanosecond so two nodes probing at once cannot fail
+/// each other.
+///
+/// `Ok(Degraded)` is the interesting return and is NOT an error: the probe
+/// worked perfectly, and reported that the store is unsafe. An `Err` means the
+/// probe could not reach a verdict at all (sink unreachable, credentials
+/// wrong), which is also a refuse-to-start condition but a different one for
+/// an operator to read.
+pub async fn probe_conditional_puts(target: &BackupTarget) -> Result<PreconditionSupport> {
+    let key = join_key(
+        &target.prefix,
+        &format!("preflight/conditional-put-{:020}-{}.canary", unix_nanos(), std::process::id()),
+    );
+    let result = probe_at_key(&target.store, &key).await;
+    // Best-effort cleanup: a leaked canary is inert (nothing reads
+    // `preflight/`), so a delete failure must not mask the verdict — which is
+    // the whole reason the caller ran this.
+    if let Err(e) = target.store.delete(&key).await {
+        tracing_delete_failure(&key, &e);
+    }
+    result
+}
+
+/// The probe body, split out so the canary is deleted on every path.
+async fn probe_at_key(
+    store: &Arc<dyn ObjectStore>,
+    key: &ObjPath,
+) -> Result<PreconditionSupport> {
+    let create = PutOptions { mode: PutMode::Create, ..Default::default() };
+
+    // 1. Claim the key. This one is *expected* to succeed; if it doesn't, the
+    //    probe cannot reach a verdict (and `AlreadyExists` here means the
+    //    per-process-per-nanosecond key collided, which is a bug, not a store
+    //    property — so it stays an error rather than a `Degraded` verdict).
+    let first = store
+        .put_opts(key, b"preflight-1".as_slice().into(), create.clone())
         .await
-        .with_context(|| format!("writing watermark sidecar {key}"))?;
-    Ok(())
+        .with_context(|| format!("preflight canary could not be created at {key}"))?;
+    let v1 = UpdateVersion { e_tag: first.e_tag.clone(), version: first.version.clone() };
+
+    // 2. Create again over a key that now exists. A store honouring
+    //    `If-None-Match` rejects this; one that succeeds has degraded.
+    match store.put_opts(key, b"preflight-2".as_slice().into(), create).await {
+        Err(object_store::Error::AlreadyExists { .. })
+        | Err(object_store::Error::Precondition { .. }) => {}
+        Ok(_) => return Ok(PreconditionSupport::Degraded { stage: PreflightStage::Create }),
+        Err(e) => {
+            return Err(e).with_context(|| format!("preflight Create probe failed at {key}"))
+        }
+    }
+
+    // 3. Advance the canary conditionally on the version we hold, to obtain a
+    //    *superseded* version. Expected to succeed — it is the ordinary
+    //    steady-state write `write_watermark` makes.
+    store
+        .put_opts(
+            key,
+            b"preflight-3".as_slice().into(),
+            PutOptions { mode: PutMode::Update(v1.clone()), ..Default::default() },
+        )
+        .await
+        .with_context(|| format!("preflight Update probe could not advance {key}"))?;
+
+    // 4. Update again on the now-stale version — exactly the shape of a fenced
+    //    writer losing the watermark race. A store honouring `If-Match`
+    //    rejects it.
+    match store
+        .put_opts(
+            key,
+            b"preflight-4".as_slice().into(),
+            PutOptions { mode: PutMode::Update(v1), ..Default::default() },
+        )
+        .await
+    {
+        Err(object_store::Error::Precondition { .. })
+        | Err(object_store::Error::AlreadyExists { .. }) => Ok(PreconditionSupport::Honoured),
+        Ok(_) => Ok(PreconditionSupport::Degraded { stage: PreflightStage::Update }),
+        Err(e) => Err(e).with_context(|| format!("preflight Update probe failed at {key}")),
+    }
+}
+
+/// turso-backup takes no logging dependency (it is a library consumed by
+/// binaries that pick their own), so a failed canary cleanup goes to stderr
+/// rather than through `tracing`.
+fn tracing_delete_failure(key: &ObjPath, e: &object_store::Error) {
+    eprintln!("turso-backup: preflight canary {key} could not be deleted: {e}");
 }
 
 /// R574-T4: compute the watermark-staleness snapshot for this call. Pure so
@@ -1221,6 +2174,224 @@ mod tests {
         }
     }
 
+    /// A store that accepts every put unconditionally — the exact failure the
+    /// preflight probe exists to catch. It is not a contrived shape: it is
+    /// what an S3-compatible backend without conditional-write support looks
+    /// like from `object_store`'s side, and what `AmazonS3Builder` degrades to
+    /// when pointed at one. Everything but `put_opts` delegates.
+    #[derive(Debug)]
+    struct UnconditionalStore {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl std::fmt::Display for UnconditionalStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "UnconditionalStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for UnconditionalStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            mut opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            opts.mode = PutMode::Overwrite;
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures_util::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A store that honours `If-None-Match` but not `If-Match`. The nastiest
+    /// real-world shape, because the bootstrap put looks fine and only the
+    /// steady-state advance — the one every tail after the first depends on —
+    /// is unguarded.
+    #[derive(Debug)]
+    struct CreateOnlyStore {
+        inner: Arc<dyn ObjectStore>,
+    }
+
+    impl std::fmt::Display for CreateOnlyStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CreateOnlyStore({})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for CreateOnlyStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            mut opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if matches!(opts.mode, PutMode::Update(_)) {
+                opts.mode = PutMode::Overwrite;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn delete_stream(
+            &self,
+            locations: futures_util::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The happy path: a store that honours both modes passes, and — the part
+    /// that matters for running this at startup against a live sink — leaves
+    /// nothing behind.
+    #[tokio::test]
+    async fn the_preflight_probe_passes_on_a_conditional_store_and_leaves_no_trace() {
+        let target = fresh_target();
+        assert_eq!(
+            probe_conditional_puts(&target).await.unwrap(),
+            PreconditionSupport::Honoured
+        );
+
+        let leftovers = objects_under(&target).await;
+        assert!(
+            leftovers.is_empty(),
+            "the probe must clean up its canary — found {leftovers:?}"
+        );
+    }
+
+    /// The whole point: a backend that silently ignores preconditions is
+    /// *reported*, not tolerated. Without this the watermark CAS degrades to
+    /// last-write-wins and every other test in this file still passes.
+    #[tokio::test]
+    async fn the_preflight_probe_catches_a_store_that_ignores_preconditions() {
+        let target = BackupTarget {
+            store: Arc::new(UnconditionalStore { inner: Arc::new(InMemory::new()) }),
+            prefix: "backups".into(),
+        };
+        assert_eq!(
+            probe_conditional_puts(&target).await.unwrap(),
+            PreconditionSupport::Degraded { stage: PreflightStage::Create },
+            "an unconditional store fails at the first guard it meets"
+        );
+    }
+
+    /// Half-degraded stores are the ones that actually ship. `If-None-Match`
+    /// works, so bootstrapping looks healthy; `If-Match` does not, so every
+    /// steady-state advance is unguarded. The probe must name `Update`
+    /// specifically — "conditional puts are broken" would send an operator to
+    /// the wrong setting.
+    #[tokio::test]
+    async fn the_preflight_probe_names_update_when_only_if_match_is_ignored() {
+        let target = BackupTarget {
+            store: Arc::new(CreateOnlyStore { inner: Arc::new(InMemory::new()) }),
+            prefix: "backups".into(),
+        };
+        assert_eq!(
+            probe_conditional_puts(&target).await.unwrap(),
+            PreconditionSupport::Degraded { stage: PreflightStage::Update }
+        );
+    }
+
+    /// The canary is keyed per process per nanosecond, so two nodes probing
+    /// the same sink at once each get a real verdict instead of failing each
+    /// other. A startup probe that flaked under concurrency would be turned
+    /// off within a week.
+    #[tokio::test]
+    async fn concurrent_preflight_probes_do_not_collide() {
+        let target = fresh_target();
+        let (a, b) = tokio::join!(
+            probe_conditional_puts(&target),
+            probe_conditional_puts(&target)
+        );
+        assert_eq!(a.unwrap(), PreconditionSupport::Honoured);
+        assert_eq!(b.unwrap(), PreconditionSupport::Honoured);
+        assert!(objects_under(&target).await.is_empty());
+    }
+
+    async fn objects_under(target: &BackupTarget) -> Vec<String> {
+        use futures_util::StreamExt;
+        target
+            .store
+            .list(None)
+            .map(|m| m.unwrap().location.to_string())
+            .collect()
+            .await
+    }
+
     fn fresh_target() -> BackupTarget {
         BackupTarget {
             store: Arc::new(InMemory::new()),
@@ -1234,6 +2405,9 @@ mod tests {
             page_size: 4096,
             backpressure: BackpressureConfig::default(),
             rpo_target: None,
+            epoch: 0,
+            owner: None,
+            pointer_generation: 0,
         }
     }
 
@@ -1258,6 +2432,9 @@ mod tests {
                 backoff: fast_backoff(),
             },
             rpo_target: None,
+            epoch: 0,
+            owner: None,
+            pointer_generation: 0,
         }
     }
 
@@ -1383,6 +2560,90 @@ mod tests {
             }
             other => panic!("expected Streamed, got {other:?}"),
         }
+    }
+
+    /// R761-F2: a call with more frames than the spill buffer holds splits
+    /// into one batch object per buffer-full, the manifest indexes every one
+    /// of them, and replay puts the frames back in order. The bound is the
+    /// only thing sizing an object, so this is also the assertion that the
+    /// largest object this sink writes stays bounded.
+    #[tokio::test]
+    async fn a_call_larger_than_the_spill_buffer_splits_into_several_batch_objects() {
+        let seam = MockWal::new(4096);
+        for i in 1..=5u32 {
+            seam.append(i, i, i as u8);
+        }
+        let target = fresh_target();
+        let cfg = bp_cfg(BackpressurePolicy::Fail, 2);
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        assert!(matches!(out, StreamOutcome::Streamed { frame_count: 5, .. }));
+
+        let manifests = list_and_parse_generation_manifests(&target).await.unwrap();
+        assert_eq!(
+            manifests[0].frame_batches,
+            vec![(1, 2), (3, 4), (5, 5)],
+            "bound 2 over 5 frames is two full batches and a remainder"
+        );
+        let frame_size = WAL_FRAME_HEADER_SIZE + 4096;
+        for (first, last) in [(1u64, 2u64), (3, 4), (5, 5)] {
+            let bytes = target
+                .store
+                .get(&target.frame_batch_key(0, 0, first, last))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(bytes.len() as u64, (last - first + 1) * frame_size as u64);
+        }
+
+        // And it all comes back, in order, through the normal read path.
+        let insert = MockInsertSeam::new();
+        assert_eq!(replay_frames_into(&target, &insert, &manifests).await.unwrap(), 5);
+        let frames: Vec<u64> = insert
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                MockInsertEvent::Frame { frame_no, .. } => Some(frame_no),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![1, 2, 3, 4, 5]);
+    }
+
+    /// R761-F2 + R574-F2: a drain that lands one batch and then gets stuck
+    /// under `Shed` publishes ONLY the batch that landed. The manifest's index
+    /// is what restore follows, so a batch list claiming a shed object would
+    /// be a 404 mid-replay — worse than the frames simply not being there.
+    #[tokio::test]
+    async fn a_partially_shed_drain_indexes_only_the_batches_that_landed() {
+        let seam = five_frame_seam();
+        // First batch through; the next one throttled until Shed gives up.
+        // Exactly enough faults to exhaust one put's retry budget and no more,
+        // so the watermark + manifest writes that follow the shed still land
+        // (they go through the same store).
+        let faults = std::iter::once(Fault::Pass).chain(std::iter::repeat_n(
+            Fault::TooManyRequests,
+            fast_backoff().max_retries as usize + 1,
+        ));
+        let target = faulty_target(faults);
+        let cfg = bp_cfg(BackpressurePolicy::Shed, 2);
+        let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { first_frame, last_frame, frame_count, backpressure, .. } => {
+                assert_eq!((first_frame, last_frame, frame_count), (1, 2, 2));
+                assert_eq!(backpressure.frames_shed, 2, "frames 3-4 were buffered and dropped");
+            }
+            other => panic!("expected a Streamed prefix, got {other:?}"),
+        }
+        let manifests = list_and_parse_generation_manifests(&target).await.unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].last_frame, 2);
+        assert_eq!(manifests[0].frame_batches, vec![(1, 2)]);
+        // Every object the manifest names actually exists — the property that
+        // makes the published prefix restorable.
+        let insert = MockInsertSeam::new();
+        assert_eq!(replay_frames_into(&target, &insert, &manifests).await.unwrap(), 2);
     }
 
     /// The high-water mark reports the peak spill-buffer occupancy for the
@@ -1528,6 +2789,9 @@ mod tests {
         let stamped = |nanos_ago: u128| PersistedWatermark {
             watermark: Watermark { checkpoint_seq: 0, last_frame: 1 },
             written_at_nanos: Some(unix_nanos().saturating_sub(nanos_ago)),
+            epoch: 0,
+            pointer_generation: 0,
+            version: None,
         };
         // No prior at all.
         let s = rpo_status(Some(Duration::from_secs(1)), None);
@@ -1536,6 +2800,9 @@ mod tests {
         let legacy = PersistedWatermark {
             watermark: Watermark::default(),
             written_at_nanos: None,
+            epoch: 0,
+            pointer_generation: 0,
+            version: None,
         };
         let s = rpo_status(Some(Duration::ZERO), Some(&legacy));
         assert_eq!((s.watermark_age, s.breached), (None, false));
@@ -1547,6 +2814,141 @@ mod tests {
         let s = rpo_status(None, Some(&stamped(5_000_000_000)));
         assert!(s.watermark_age.is_some());
         assert!(!s.breached);
+    }
+
+    /// R761-T1: the shipped cadence default is an arithmetic consequence of
+    /// the 2026-08-13 `tail_sweep_harness` table, so the arithmetic is a
+    /// test rather than a claim in a comment nobody re-checks. If a future
+    /// harness run moves the measured points, this test is where the
+    /// mismatch surfaces — re-derive the default, do not relax the test.
+    #[test]
+    fn default_tail_cadence_matches_the_measured_write_op_curve() {
+        // Every uploading tail_frames call writes exactly two fixed objects
+        // beyond the frames: one generation manifest, one watermark CAS.
+        const FIXED_OBJECTS_PER_TAIL: f64 = 2.0;
+        // Measured, flat across the whole sweep — a property of the schema
+        // and transaction shape, not of the cadence.
+        const MEASURED_FRAMES_PER_WRITE: f64 = 2.03;
+        let puts_per_write =
+            |w: f64| MEASURED_FRAMES_PER_WRITE + FIXED_OBJECTS_PER_TAIL / w;
+
+        // The model reproduces all four measured rows.
+        for (writes_per_tail, measured) in [(1.0, 4.03), (5.0, 2.43), (25.0, 2.11), (100.0, 2.05)] {
+            let modelled = puts_per_write(writes_per_tail);
+            assert!(
+                (modelled - measured).abs() < 0.005,
+                "writes_per_tail={writes_per_tail}: model {modelled:.3} vs measured {measured:.3}"
+            );
+        }
+
+        // The default is tailed at half the stated bound, so one missed tick
+        // still lands inside the promise.
+        assert_eq!(DEFAULT_RPO_TARGET, DEFAULT_TAIL_INTERVAL * 2);
+
+        // At the burst rates the default was chosen against (~0.1-1 write/s
+        // during an active session), 60s lands in the flat part of the curve:
+        // the fixed-object term is under a fifth of the frame floor even at
+        // the slow end, where 15s would still be paying 1.33.
+        let slow_burst_writes_per_tail = 0.1 * DEFAULT_TAIL_INTERVAL.as_secs_f64();
+        let fixed_term = FIXED_OBJECTS_PER_TAIL / slow_burst_writes_per_tail;
+        assert!(
+            fixed_term < MEASURED_FRAMES_PER_WRITE / 5.0,
+            "fixed-object term {fixed_term:.3} at the slow-burst end is no longer small \
+             relative to the {MEASURED_FRAMES_PER_WRITE} frame floor"
+        );
+        assert!(
+            puts_per_write(slow_burst_writes_per_tail) < 2.4,
+            "the default's worst modelled case should sit below the measured \
+             writes_per_tail=5 point (2.43)"
+        );
+
+        // R761-F2 removed the frames/write term: a tail call whose frames fit
+        // one batch writes the batch, the manifest and the watermark, full
+        // stop. Same curve shape, no floor.
+        let batched_puts_per_write = |w: f64| (1.0 + FIXED_OBJECTS_PER_TAIL) / w;
+        for (writes_per_tail, pre_batching) in [(1.0, 4.03), (5.0, 2.43), (25.0, 2.11), (100.0, 2.05)]
+        {
+            let cut = 1.0 - batched_puts_per_write(writes_per_tail) / pre_batching;
+            let want = match writes_per_tail as u32 {
+                1 => 0.256,
+                5 => 0.753,
+                25 => 0.943,
+                _ => 0.985,
+            };
+            assert!(
+                (cut - want).abs() < 0.005,
+                "writes_per_tail={writes_per_tail}: batching cuts {:.1}%, expected {:.1}%",
+                cut * 100.0,
+                want * 100.0,
+            );
+        }
+        // Which is why the cadence default did not move: what is left to win
+        // past 60s is now a hundredth of a PUT per write at the fast-burst end
+        // of the same band, against an RPO window that would grow 5x.
+        assert!(
+            batched_puts_per_write(1.0 * DEFAULT_TAIL_INTERVAL.as_secs_f64())
+                - batched_puts_per_write(5.0 * DEFAULT_TAIL_INTERVAL.as_secs_f64())
+                < 0.05,
+            "batching should have flattened the cadence lever at the fast-burst end"
+        );
+    }
+
+    /// R782: `StreamOutcome::rpo()` is the accessor `tenant-streamer` pushes
+    /// through — every variant that carries an `RpoStatus` gives it back, and
+    /// `Fenced` (which deliberately carries none, per its own doc) gives
+    /// `None` rather than a default/synthesized one.
+    #[test]
+    fn stream_outcome_rpo_accessor_covers_every_variant() {
+        let rpo = RpoStatus { target: None, watermark_age: Some(Duration::from_secs(1)), breached: false };
+        assert_eq!(StreamOutcome::Empty { watermark: Watermark::default(), rpo }.rpo(), Some(&rpo));
+        assert_eq!(
+            StreamOutcome::Streamed {
+                generation_key: String::new(),
+                first_frame: 1,
+                last_frame: 1,
+                checkpoint_seq: 0,
+                frame_count: 1,
+                backpressure: Default::default(),
+                rpo,
+            }
+            .rpo(),
+            Some(&rpo)
+        );
+        assert_eq!(
+            StreamOutcome::Restarted {
+                generation_key: String::new(),
+                previous_checkpoint_seq: 0,
+                new_checkpoint_seq: 1,
+                first_frame: 1,
+                last_frame: 1,
+                frame_count: 1,
+                backpressure: Default::default(),
+                rpo,
+            }
+            .rpo(),
+            Some(&rpo)
+        );
+        assert_eq!(
+            StreamOutcome::Shed {
+                checkpoint_seq: 0,
+                first_frame: 1,
+                last_frame: 1,
+                backpressure: Default::default(),
+                rpo,
+            }
+            .rpo(),
+            Some(&rpo)
+        );
+        assert_eq!(
+            StreamOutcome::Fenced {
+                current_epoch: 2,
+                our_epoch: 1,
+                current_pointer_generation: 0,
+                our_pointer_generation: 0,
+            }
+            .rpo(),
+            None
+        );
     }
 
     /// First tail with no frames yet — Empty, no manifest, no watermark.
@@ -1602,20 +3004,28 @@ mod tests {
             other => panic!("expected Streamed, got {other:?}"),
         };
 
-        // Frame keys exist + carry the right bytes.
+        // R761-F2: ONE batch object holds all three frames, at the ranged key,
+        // each frame at its own offset inside it.
+        let frame_size = WAL_FRAME_HEADER_SIZE + 4096;
+        let bytes = target
+            .store
+            .get(&target.frame_batch_key(0, 0, 1, 3))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), 3 * frame_size);
         for frame_no in 1..=3u64 {
-            let bytes = target
-                .store
-                .get(&target.frame_key(0, frame_no))
-                .await
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap();
-            assert_eq!(bytes.len(), WAL_FRAME_HEADER_SIZE + 4096);
-            let page_no = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+            let at = (frame_no as usize - 1) * frame_size;
+            let page_no = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
             assert_eq!(page_no, frame_no as u32);
         }
+        // And nothing was written per-frame.
+        assert!(
+            target.store.get(&target.frame_key(0, 0, 1)).await.is_err(),
+            "the pre-R761-F2 per-frame key must not be written any more"
+        );
 
         // Manifest is parseable and round-trips.
         let m_bytes = target
@@ -1632,6 +3042,7 @@ mod tests {
         assert_eq!(parsed.checkpoint_seq, 0);
         assert_eq!(parsed.page_size, 4096);
         assert_eq!(parsed.base_snapshot_key, cfg().base_snapshot_key);
+        assert_eq!(parsed.frame_batches, vec![(1, 3)], "R761-F2: one batch, indexed");
 
         // Watermark sidecar matches.
         let wm = read_watermark(&target.store, &target.watermark_key())
@@ -1698,11 +3109,13 @@ mod tests {
             other => panic!("expected Streamed, got {other:?}"),
         }
         assert_eq!(seam.frame_count(), 4);
-        // Frames 1..=4 all retrievable under checkpoint_seq=0.
-        for frame_no in 1..=4u64 {
+        // Frames 1..=4 all retrievable under checkpoint_seq=0, as one batch
+        // object per tail call — the first call's object is untouched by the
+        // second (disjoint ranges, so no overwrite and no re-upload).
+        for (first, last) in [(1u64, 2u64), (3, 4)] {
             target
                 .store
-                .get(&target.frame_key(0, frame_no))
+                .get(&target.frame_batch_key(0, 0, first, last))
                 .await
                 .unwrap();
         }
@@ -1741,15 +3154,16 @@ mod tests {
             other => panic!("expected Restarted, got {other:?}"),
         }
 
-        // Old seq=0 frames still in place; new seq=1 frame at its own key.
+        // Old seq=0 frames still in place; new seq=1 frame under its own
+        // sequence — same key shape, different directory.
         target
             .store
-            .get(&target.frame_key(0, 1))
+            .get(&target.frame_batch_key(0, 0, 1, 2))
             .await
             .unwrap();
         target
             .store
-            .get(&target.frame_key(1, 1))
+            .get(&target.frame_batch_key(0, 1, 1, 1))
             .await
             .unwrap();
     }
@@ -1803,6 +3217,12 @@ mod tests {
             checkpoint_seq,
             first_frame,
             last_frame,
+            epoch: 0,
+            owner: None,
+            // Chain validation is about frame ranges, not object layout, so
+            // these fixtures stay on the pre-R761-F2 shape — which also keeps
+            // them exercising the legacy read path.
+            frame_batches: Vec::new(),
         }
     }
 
@@ -1912,7 +3332,7 @@ mod tests {
 
         let manifests = list_and_parse_generation_manifests(&target).await.unwrap();
         let insert = MockInsertSeam::new();
-        let total = replay_frames_into(&target, &insert, &manifests, 4096)
+        let total = replay_frames_into(&target, &insert, &manifests)
             .await
             .unwrap();
         assert_eq!(total, 4);
@@ -1932,6 +3352,97 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// R761-F2 read compatibility, and the reason `frame_batches` being empty
+    /// has to MEAN something rather than merely be absent: a sink written by a
+    /// pre-batching writer — per-frame objects, a v2 manifest — still replays,
+    /// and a chain that straddles the change replays as one stream. Written
+    /// here by hand at the object level, because the writer that produced this
+    /// shape no longer exists to produce it.
+    #[tokio::test]
+    async fn a_chain_straddling_the_batching_change_replays_as_one_stream() {
+        let target = fresh_target();
+        let frame_size = WAL_FRAME_HEADER_SIZE + 4096;
+        let frame = |frame_no: u64, page_no: u32, db_size: u32| {
+            let mut b = vec![0u8; frame_size];
+            b[0..4].copy_from_slice(&page_no.to_be_bytes());
+            b[4..8].copy_from_slice(&db_size.to_be_bytes());
+            b[WAL_FRAME_HEADER_SIZE..].fill(frame_no as u8);
+            b
+        };
+
+        // Generation 1: the old layout — one object per frame, v2 manifest
+        // with no batch list.
+        for frame_no in 1..=2u64 {
+            target
+                .store
+                .put(
+                    &target.frame_key(0, 0, frame_no),
+                    frame(frame_no, frame_no as u32, frame_no as u32).into(),
+                )
+                .await
+                .unwrap();
+        }
+        let legacy = format_generation_manifest(GenerationManifest {
+            base_snapshot_key: "b.db",
+            page_size: 4096,
+            checkpoint_seq: 0,
+            first_frame: 1,
+            last_frame: 2,
+            epoch: 0,
+            owner: None,
+            frame_batches: &[],
+        });
+        assert!(legacy.starts_with("TURSO-BACKUP STREAM v2\n"), "{legacy}");
+        target
+            .store
+            .put(&target.generation_key(1), legacy.into_bytes().into())
+            .await
+            .unwrap();
+
+        // Generation 2: the new layout, batched, appended to the same chain.
+        let mut batch = frame(3, 3, 0);
+        batch.extend_from_slice(&frame(4, 4, 4));
+        target
+            .store
+            .put(&target.frame_batch_key(0, 0, 3, 4), batch.into())
+            .await
+            .unwrap();
+        let batched = format_generation_manifest(GenerationManifest {
+            base_snapshot_key: "b.db",
+            page_size: 4096,
+            checkpoint_seq: 0,
+            first_frame: 3,
+            last_frame: 4,
+            epoch: 0,
+            owner: None,
+            frame_batches: &[(3, 4)],
+        });
+        target
+            .store
+            .put(&target.generation_key(2), batched.into_bytes().into())
+            .await
+            .unwrap();
+
+        let manifests = list_and_parse_generation_manifests(&target).await.unwrap();
+        assert!(manifests[0].frame_batches.is_empty(), "gen 1 is the legacy layout");
+        assert_eq!(manifests[1].frame_batches, vec![(3, 4)]);
+        validate_generation_chain(&manifests).expect("layout is not a chain property");
+
+        let insert = MockInsertSeam::new();
+        assert_eq!(replay_frames_into(&target, &insert, &manifests).await.unwrap(), 4);
+        assert_eq!(
+            insert.events(),
+            (1..=4u64)
+                .map(|n| MockInsertEvent::Frame {
+                    frame_no: n,
+                    page_no: n as u32,
+                    db_size: if n == 3 { 0 } else { n as u32 },
+                })
+                .collect::<Vec<_>>(),
+            "both layouts deliver the same frames in the same order"
+        );
     }
 
     /// restore_latest_stream errors loudly when there are no manifests under
@@ -1961,16 +3472,17 @@ mod tests {
         let target = fresh_target();
         let _ = tail_frames(&seam, &target, &cfg()).await.unwrap();
 
-        // Overwrite the one uploaded frame with garbage of the wrong length.
+        // Overwrite the one uploaded frame object with garbage of the wrong
+        // length.
         target
             .store
-            .put(&target.frame_key(0, 1), b"too short".to_vec().into())
+            .put(&target.frame_batch_key(0, 0, 1, 1), b"too short".to_vec().into())
             .await
             .unwrap();
 
         let manifests = list_and_parse_generation_manifests(&target).await.unwrap();
         let insert = MockInsertSeam::new();
-        let err = replay_frames_into(&target, &insert, &manifests, 4096)
+        let err = replay_frames_into(&target, &insert, &manifests)
             .await
             .unwrap_err();
         assert!(format!("{err}").contains("expected"), "err was {err}");
@@ -2075,6 +3587,9 @@ mod tests {
                 page_size: 4096,
                 backpressure: BackpressureConfig::default(),
                 rpo_target: None,
+                epoch: 0,
+                owner: None,
+                pointer_generation: 0,
             };
             let outcome = tail_frames(&seam, &target, &cfg).await.unwrap();
             match outcome {
@@ -2146,6 +3661,9 @@ mod tests {
                 page_size: 4096,
                 backpressure: BackpressureConfig::default(),
                 rpo_target: None,
+                epoch: 0,
+                owner: None,
+                pointer_generation: 0,
             };
             let _ = tail_frames(&seam, &target, &cfg).await.unwrap();
             let w = seam.wal_state().unwrap();
@@ -2155,16 +3673,19 @@ mod tests {
         // Manually upload one extra "uncommitted" frame: copy the last
         // committed frame's bytes but zero db_size in the header. This
         // simulates tail_frames having captured a mid-transaction tail.
-        let last_key = target.frame_key(checkpoint_seq, last_committed_frame);
-        let mut tail_bytes = target
+        // R761-F2: the frames live in one batch object, so take the last
+        // frame's slice out of it rather than fetching a per-frame key.
+        let batch_key = target.frame_batch_key(0, checkpoint_seq, 1, last_committed_frame);
+        let batch = target
             .store
-            .get(&last_key)
+            .get(&batch_key)
             .await
             .unwrap()
             .bytes()
             .await
-            .unwrap()
-            .to_vec();
+            .unwrap();
+        let at = (last_committed_frame as usize - 1) * frame_size;
+        let mut tail_bytes = batch[at..at + frame_size].to_vec();
         // Zero the big-endian db_size at offset 4..8 to mark this as non-commit.
         tail_bytes[4..8].copy_from_slice(&0u32.to_be_bytes());
         // Repad to ensure exact length — paranoia.
@@ -2172,7 +3693,10 @@ mod tests {
         let phantom_frame_no = last_committed_frame + 1;
         target
             .store
-            .put(&target.frame_key(checkpoint_seq, phantom_frame_no), tail_bytes.into())
+            .put(
+                &target.frame_batch_key(0, checkpoint_seq, phantom_frame_no, phantom_frame_no),
+                tail_bytes.into(),
+            )
             .await
             .unwrap();
 
@@ -2198,12 +3722,19 @@ mod tests {
             .unwrap();
         let mut m = parse_generation_manifest(&String::from_utf8_lossy(&bytes)).unwrap();
         m.last_frame = phantom_frame_no;
+        // The phantom frame went up as its own single-frame batch object, so
+        // the manifest's index has to name it too — the range alone is no
+        // longer enough to find a frame (R761-F2).
+        m.frame_batches.push((phantom_frame_no, phantom_frame_no));
         let new_text = format_generation_manifest(GenerationManifest {
             base_snapshot_key: &m.base_snapshot_key,
             page_size: m.page_size,
             checkpoint_seq: m.checkpoint_seq,
             first_frame: m.first_frame,
             last_frame: m.last_frame,
+            epoch: m.epoch,
+            owner: m.owner.as_deref(),
+            frame_batches: &m.frame_batches,
         });
         target
             .store
@@ -2350,6 +3881,859 @@ mod tests {
         assert_eq!(count_rows(r2.path()).await, 12);
     }
 
+    // ── R732-F2 (W245): tenant fencing epochs on the R2 write path ────────
+    //
+    // The property under test throughout: a writer holding a stale fencing
+    // token is REJECTED, not merely unlucky. Every test below names the
+    // split-brain it rules out.
+
+    fn cfg_at_epoch(epoch: u64, owner: Option<&'static str>) -> StreamConfig<'static> {
+        StreamConfig { epoch, owner, ..cfg() }
+    }
+
+    /// R736-T2: like `cfg_at_epoch`, but also names the cross-cell pointer
+    /// generation this writer believes it holds.
+    fn cfg_at(epoch: u64, pointer_generation: u64, owner: Option<&'static str>) -> StreamConfig<'static> {
+        StreamConfig { epoch, pointer_generation, owner, ..cfg() }
+    }
+
+    /// THE canonical F2 test, and the reason the whole relay exists: two
+    /// owners tailing the same tenant. The one at the older epoch bounces and
+    /// writes nothing; the sink is byte-for-byte what the newer owner left.
+    #[tokio::test]
+    async fn a_stale_writer_is_fenced_and_writes_zero_frames() {
+        let target = fresh_target();
+
+        // The real owner (epoch 2) streams three frames.
+        let winner = MockWal::new(4096);
+        for i in 1..=3u32 {
+            winner.append(i, i, i as u8);
+        }
+        let out = tail_frames(&winner, &target, &cfg_at_epoch(2, Some("node-2")))
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamOutcome::Streamed { frame_count: 3, .. }));
+
+        let manifests_before = list_and_parse_generation_manifests(&target).await.unwrap();
+        let watermark_before = read_watermark(&target.store, &target.watermark_key())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The partitioned old owner (epoch 1) wakes up with its own frames and
+        // tails the same sink, unaware it has been transferred away.
+        let loser = MockWal::new(4096);
+        for i in 1..=9u32 {
+            loser.append(i, i, 0xff);
+        }
+        let out = tail_frames(&loser, &target, &cfg_at_epoch(1, Some("node-1")))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            StreamOutcome::Fenced {
+                current_epoch: 2,
+                our_epoch: 1,
+                current_pointer_generation: 0,
+                our_pointer_generation: 0,
+            },
+            "the stale owner must be told it lost, with both epochs"
+        );
+
+        // Zero side effects: no frames under its own epoch prefix, no extra
+        // generation, and the watermark still names the winner.
+        // Nothing at all under the loser's epoch prefix — asserted by listing
+        // rather than by probing one key, so it holds whatever object layout
+        // the writer would have used (R761-F2).
+        let loser_prefix = "backups/frames/00000000000000000001/";
+        assert!(
+            !objects_under(&target)
+                .await
+                .iter()
+                .any(|k| k.starts_with(loser_prefix)),
+            "a fenced writer must not upload a single frame"
+        );
+        let manifests_after = list_and_parse_generation_manifests(&target).await.unwrap();
+        assert_eq!(
+            manifests_after, manifests_before,
+            "a fenced writer must not write a generation manifest"
+        );
+        let watermark_after = read_watermark(&target.store, &target.watermark_key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(watermark_after.epoch, 2);
+        assert_eq!(watermark_after.watermark, watermark_before.watermark);
+    }
+
+    /// An UNFENCED (epoch 0) legacy streamer is fenced by a sink that has been
+    /// claimed. This is the migration case: a node still running the old
+    /// single-writer configuration must not be allowed to scribble over a
+    /// tenant that yubaba has since handed to someone else.
+    #[tokio::test]
+    async fn an_unfenced_writer_is_fenced_by_a_claimed_sink() {
+        let target = fresh_target();
+        let owner = MockWal::new(4096);
+        owner.append(1, 1, 1);
+        tail_frames(&owner, &target, &cfg_at_epoch(1, None)).await.unwrap();
+
+        let legacy = MockWal::new(4096);
+        legacy.append(1, 1, 2);
+        assert_eq!(
+            tail_frames(&legacy, &target, &cfg_at_epoch(0, None)).await.unwrap(),
+            StreamOutcome::Fenced {
+                current_epoch: 1,
+                our_epoch: 0,
+                current_pointer_generation: 0,
+                our_pointer_generation: 0,
+            }
+        );
+    }
+
+    // ── R736-T2 (W250): the second, cross-cell fence ───────────────────────
+    //
+    // The epoch alone is a *local* raft counter — it cannot see a tenant
+    // that moved to a different cell's independent raft group. These tests
+    // prove the pointer generation catches exactly the case the epoch can't:
+    // a stale cell that is current on its own epoch.
+
+    /// THE canonical T2 test: a writer whose epoch is perfectly current for
+    /// its own (now-stale) cell still bounces, because the global pointer
+    /// says ownership moved elsewhere. Proves the epoch is necessary but not
+    /// sufficient — this is the gap W250 exists to close.
+    #[tokio::test]
+    async fn a_stale_pointer_generation_fences_even_at_a_current_epoch() {
+        let target = fresh_target();
+
+        // The new cell streams at generation 2, epoch 1 (its own local raft
+        // is fresh — it just took ownership).
+        let winner = MockWal::new(4096);
+        for i in 1..=3u32 {
+            winner.append(i, i, i as u8);
+        }
+        let out = tail_frames(&winner, &target, &cfg_at(1, 2, Some("cell-b/node-1")))
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamOutcome::Streamed { frame_count: 3, .. }));
+
+        // The old cell's writer wakes up unaware of the move. Its own local
+        // epoch (1) is perfectly current for its own raft group — nothing
+        // local told it to step down — but its pointer generation (1) is
+        // behind the sink's (2).
+        let loser = MockWal::new(4096);
+        for i in 1..=9u32 {
+            loser.append(i, i, 0xff);
+        }
+        let out = tail_frames(&loser, &target, &cfg_at(1, 1, Some("cell-a/node-1")))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            StreamOutcome::Fenced {
+                current_epoch: 1,
+                our_epoch: 1,
+                current_pointer_generation: 2,
+                our_pointer_generation: 1,
+            },
+            "an equal, non-stale epoch must not mask a stale pointer generation"
+        );
+
+        // Zero side effects, exactly like the epoch-only fence.
+        let manifests = list_and_parse_generation_manifests(&target).await.unwrap();
+        assert_eq!(manifests.len(), 1, "only the winner's generation was written");
+    }
+
+    /// The watermark sidecar carries the pointer generation as a fifth
+    /// positional field, and a four-field sidecar (pre-R736-T2 writer) reads
+    /// back generation 0 — unfenced, exactly like a pre-R732 sidecar reads
+    /// back epoch 0.
+    #[tokio::test]
+    async fn watermark_sidecar_round_trips_the_pointer_generation() {
+        let target = fresh_target();
+        let key = target.watermark_key();
+        write_watermark(
+            &target.store,
+            &key,
+            Watermark { checkpoint_seq: 2, last_frame: 11 },
+            6,
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+        let read = read_watermark(&target.store, &key).await.unwrap().unwrap();
+        assert_eq!((read.epoch, read.pointer_generation), (6, 3));
+
+        // A four-field sidecar (epoch, no generation) — the R732-F2 shape.
+        target
+            .store
+            .put(&key, b"2 11 12345 6\n".to_vec().into())
+            .await
+            .unwrap();
+        let legacy = read_watermark(&target.store, &key).await.unwrap().unwrap();
+        assert_eq!(legacy.epoch, 6);
+        assert_eq!(legacy.pointer_generation, 0, "a pre-R736-T2 sidecar fences nobody on generation");
+    }
+
+    /// The same owner resuming at the same epoch is NOT fenced — fencing is
+    /// strictly "someone newer exists", not "someone else wrote here". An
+    /// owner that restarts under an unchanged token must keep streaming, or
+    /// every process restart would wedge the tenant.
+    #[tokio::test]
+    async fn an_equal_epoch_writer_resumes_normally() {
+        let target = fresh_target();
+        let seam = MockWal::new(4096);
+        seam.append(1, 1, 1);
+        tail_frames(&seam, &target, &cfg_at_epoch(3, None)).await.unwrap();
+        seam.append(2, 2, 2);
+        let out = tail_frames(&seam, &target, &cfg_at_epoch(3, None)).await.unwrap();
+        match out {
+            StreamOutcome::Streamed { first_frame, last_frame, .. } => {
+                assert_eq!((first_frame, last_frame), (2, 2), "resumes after the watermark");
+            }
+            other => panic!("expected Streamed, got {other:?}"),
+        }
+    }
+
+    /// Frame keys are namespaced by epoch, and epoch 0 keeps the pre-fencing
+    /// two-level layout so existing backups stay addressable.
+    #[test]
+    fn frame_keys_are_namespaced_by_epoch_with_zero_keeping_the_legacy_layout() {
+        let target = fresh_target();
+        assert_eq!(
+            target.frame_key(0, 7, 42).to_string(),
+            "backups/frames/0000000007/00000000000000000042",
+            "epoch 0 must keep the original key shape"
+        );
+        assert_eq!(
+            target.frame_key(5, 7, 42).to_string(),
+            "backups/frames/00000000000000000005/0000000007/00000000000000000042"
+        );
+        assert_ne!(target.frame_key(5, 7, 42), target.frame_key(6, 7, 42));
+    }
+
+    /// R761-F2: a batch key carries its frame range, keeps the epoch
+    /// namespacing and the zero-padding (so lexical order is still frame
+    /// order), and cannot be confused with a pre-batching per-frame key even
+    /// when the batch holds exactly one frame.
+    #[test]
+    fn batch_keys_carry_the_range_and_never_collide_with_a_per_frame_key() {
+        let target = fresh_target();
+        assert_eq!(
+            target.frame_batch_key(0, 7, 42, 99).to_string(),
+            "backups/frames/0000000007/00000000000000000042-00000000000000000099",
+            "epoch 0 keeps the two-level layout for batches too"
+        );
+        assert_eq!(
+            target.frame_batch_key(5, 7, 42, 99).to_string(),
+            "backups/frames/00000000000000000005/0000000007/00000000000000000042-00000000000000000099"
+        );
+        assert_ne!(
+            target.frame_batch_key(0, 7, 42, 42),
+            target.frame_key(0, 7, 42),
+            "a one-frame batch is still a batch — the two layouts must stay distinguishable"
+        );
+        // Lexical order matches frame order for the batches of one stream,
+        // which never overlap.
+        assert!(
+            target.frame_batch_key(0, 7, 1, 8) < target.frame_batch_key(0, 7, 9, 16),
+            "zero-padding must keep batches lexically ordered by first frame"
+        );
+    }
+
+    /// A takeover mid-stream leaves both owners' frames intact under their own
+    /// prefixes — the key namespacing is the backstop behind the epoch check.
+    #[tokio::test]
+    async fn a_takeover_writes_under_its_own_epoch_prefix_without_disturbing_the_old_one() {
+        let target = fresh_target();
+        let seam = MockWal::new(4096);
+        seam.append(1, 1, 0xaa);
+        tail_frames(&seam, &target, &cfg_at_epoch(1, None)).await.unwrap();
+        seam.append(2, 2, 0xbb);
+        tail_frames(&seam, &target, &cfg_at_epoch(2, None)).await.unwrap();
+
+        let first = target.store.get(&target.frame_batch_key(1, 0, 1, 1)).await.unwrap();
+        assert_eq!(first.bytes().await.unwrap().len(), WAL_FRAME_HEADER_SIZE + 4096);
+        target
+            .store
+            .get(&target.frame_batch_key(2, 0, 2, 2))
+            .await
+            .expect("the new owner's frame lives under its own epoch");
+        assert!(
+            target.store.get(&target.frame_batch_key(1, 0, 2, 2)).await.is_err(),
+            "the new owner must not write into the old owner's prefix"
+        );
+    }
+
+    /// Restore refuses a chain whose epoch goes backwards: a generation
+    /// written by an owner that had already been fenced. Replaying it would
+    /// interleave a stale owner's frames into the live stream.
+    #[test]
+    fn validate_chain_refuses_an_epoch_regression() {
+        let mut newer = mk_manifest("base.db", 4096, 0, 1, 5);
+        newer.epoch = 4;
+        let mut stale = mk_manifest("base.db", 4096, 0, 6, 9);
+        stale.epoch = 3;
+        let err = validate_generation_chain(&[newer, stale]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("epoch 3"), "err was {msg}");
+        assert!(msg.contains("fenced"), "err must name the cause: {msg}");
+    }
+
+    /// …but a chain that spans an ownership TRANSFER is fine. Epochs may
+    /// advance mid-stream; only regression is corruption.
+    #[test]
+    fn validate_chain_accepts_a_transfer_mid_chain() {
+        let mut first = mk_manifest("base.db", 4096, 0, 1, 5);
+        first.epoch = 3;
+        let mut second = mk_manifest("base.db", 4096, 0, 6, 9);
+        second.epoch = 4;
+        let chain = validate_generation_chain(&[first, second]).unwrap();
+        assert_eq!(chain.total_frames, 9);
+        assert_eq!(chain.epoch, 4, "the chain reports the most recent owner");
+    }
+
+    /// A pre-fencing chain still validates and reports epoch 0.
+    #[test]
+    fn validate_chain_of_pre_fencing_manifests_reports_epoch_zero() {
+        let chain = validate_generation_chain(&[mk_manifest("base.db", 4096, 0, 1, 5)]).unwrap();
+        assert_eq!(chain.epoch, 0);
+    }
+
+    /// Manifest v2 round-trips the epoch and the owner label.
+    #[test]
+    fn manifest_v2_round_trips_epoch_and_owner() {
+        let text = format_generation_manifest(GenerationManifest {
+            base_snapshot_key: "backups/snapshots/snapshot-1.db",
+            page_size: 4096,
+            checkpoint_seq: 7,
+            first_frame: 12,
+            last_frame: 34,
+            epoch: 9,
+            owner: Some("node-3"),
+            frame_batches: &[],
+        });
+        assert!(text.starts_with("TURSO-BACKUP STREAM v2\n"), "{text}");
+        let parsed = parse_generation_manifest(&text).unwrap();
+        assert_eq!(parsed.epoch, 9);
+        assert_eq!(parsed.owner.as_deref(), Some("node-3"));
+
+        // No owner label → the key is omitted entirely, not written empty.
+        let text = format_generation_manifest(GenerationManifest {
+            base_snapshot_key: "b.db",
+            page_size: 4096,
+            checkpoint_seq: 0,
+            first_frame: 1,
+            last_frame: 1,
+            epoch: 1,
+            owner: None,
+            frame_batches: &[],
+        });
+        assert!(!text.contains("owner"), "{text}");
+        assert_eq!(parse_generation_manifest(&text).unwrap().owner, None);
+    }
+
+    /// R761-F2: a batch list round-trips, and its presence is what moves the
+    /// header to v3 — the version and the layout are one fact, so a reader can
+    /// never see a v3 header without an index or a v2 header with one.
+    #[test]
+    fn manifest_v3_round_trips_the_frame_batch_list() {
+        let batches = [(12u64, 20u64), (21, 34)];
+        let text = format_generation_manifest(GenerationManifest {
+            base_snapshot_key: "backups/snapshots/snapshot-1.db",
+            page_size: 4096,
+            checkpoint_seq: 7,
+            first_frame: 12,
+            last_frame: 34,
+            epoch: 9,
+            owner: Some("node-3"),
+            frame_batches: &batches,
+        });
+        assert!(text.starts_with("TURSO-BACKUP STREAM v3\n"), "{text}");
+        let parsed = parse_generation_manifest(&text).unwrap();
+        assert_eq!(parsed.frame_batches, batches.to_vec());
+        assert_eq!(parsed.first_frame, 12);
+        assert_eq!(parsed.last_frame, 34);
+        assert_eq!(parsed.owner.as_deref(), Some("node-3"));
+    }
+
+    /// A v3 batch list that does not exactly tile the manifest's own frame
+    /// range is corruption, and it has to fail at parse: the list IS the frame
+    /// index, so a hole in it becomes a 404 halfway through a replay — after
+    /// the destination has already been overwritten with the base snapshot.
+    #[test]
+    fn a_v3_manifest_whose_batches_do_not_tile_its_range_is_rejected() {
+        let head = "TURSO-BACKUP STREAM v3\nbase_snapshot b.db\npage_size 4096\ncheckpoint_seq 0\nepoch 0\n";
+        for (batches, want, why) in [
+            ("frame_batch 1-3\nframe_batch 5-9\n", "does not continue", "gap"),
+            ("frame_batch 1-3\n", "but the manifest claims", "short"),
+            ("frame_batch 2-9\n", "does not continue", "wrong start"),
+            ("frame_batch 1-4\nframe_batch 4-9\n", "does not continue", "overlap"),
+            ("", "no `frame_batch` lines", "missing index"),
+        ] {
+            let text = format!("{head}first_frame 1\nlast_frame 9\n{batches}");
+            let err = parse_generation_manifest(&text).unwrap_err();
+            assert!(
+                format!("{err}").contains(want),
+                "{why}: expected {want:?}, err was {err}"
+            );
+        }
+    }
+
+    /// The other direction: a `frame_batch` line under a v1/v2 header is
+    /// corrupt too. Silently honouring it would let a hand-edited manifest
+    /// claim a layout its header says it does not have.
+    #[test]
+    fn a_pre_v3_manifest_carrying_a_batch_line_is_rejected() {
+        let bad = "TURSO-BACKUP STREAM v2\nbase_snapshot b.db\npage_size 4096\ncheckpoint_seq 0\nfirst_frame 1\nlast_frame 3\nepoch 0\nframe_batch 1-3\n";
+        let err = parse_generation_manifest(bad).unwrap_err();
+        assert!(format!("{err}").contains("corrupt or hand-edited"), "err was {err}");
+    }
+
+    /// A v1 manifest — one written before fencing existed — still parses, as
+    /// epoch 0. Those backups have to stay restorable.
+    #[test]
+    fn a_v1_manifest_parses_as_epoch_zero() {
+        let legacy = "TURSO-BACKUP STREAM v1\nbase_snapshot b.db\npage_size 4096\ncheckpoint_seq 0\nfirst_frame 1\nlast_frame 3\n";
+        let parsed = parse_generation_manifest(legacy).unwrap();
+        assert_eq!(parsed.epoch, 0);
+        assert_eq!(parsed.owner, None);
+        assert_eq!(parsed.last_frame, 3);
+    }
+
+    /// A v2 manifest missing its epoch is corrupt, not legacy. Defaulting it
+    /// to 0 would silently demote a fenced generation to unfenced — the one
+    /// direction this mechanism must never fail in.
+    #[test]
+    fn a_v2_manifest_without_an_epoch_is_rejected() {
+        let bad = "TURSO-BACKUP STREAM v2\nbase_snapshot b.db\npage_size 4096\ncheckpoint_seq 0\nfirst_frame 1\nlast_frame 3\n";
+        let err = parse_generation_manifest(bad).unwrap_err();
+        assert!(format!("{err}").contains("missing `epoch`"), "err was {err}");
+    }
+
+    /// The watermark sidecar carries the epoch as a fourth positional field,
+    /// and a three-field sidecar (pre-R732 writer) reads back as epoch 0.
+    #[tokio::test]
+    async fn watermark_sidecar_round_trips_the_epoch() {
+        let target = fresh_target();
+        let key = target.watermark_key();
+        write_watermark(
+            &target.store,
+            &key,
+            Watermark { checkpoint_seq: 2, last_frame: 11 },
+            6,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let read = read_watermark(&target.store, &key).await.unwrap().unwrap();
+        assert_eq!(read.epoch, 6);
+        assert_eq!(read.watermark.last_frame, 11);
+        assert!(read.written_at_nanos.is_some());
+
+        target
+            .store
+            .put(&key, b"2 11 12345\n".to_vec().into())
+            .await
+            .unwrap();
+        let legacy = read_watermark(&target.store, &key).await.unwrap().unwrap();
+        assert_eq!(legacy.epoch, 0, "a pre-R732 sidecar fences nobody");
+        assert_eq!(legacy.written_at_nanos, Some(12345));
+    }
+
+    /// End-to-end on a real DB: an ownership transfer happens mid-stream and
+    /// the restore is clean — every frame from both owners replays, and the
+    /// outcome reports the winning epoch. This is the "the N+1 writer wins;
+    /// restore is clean" half of the ticket's ask, run against turso_core
+    /// rather than a mock.
+    #[tokio::test]
+    async fn a_transfer_mid_stream_restores_cleanly_and_reports_the_new_epoch() {
+        let src = TempDb::new("src-epoch");
+        let dest = TempDb::new("dest-epoch");
+        seed_rows(src.path(), 0, 50).await;
+
+        let target = fresh_target();
+        let base_key = match crate::snapshot::snapshot_and_upload(src.path(), &target)
+            .await
+            .unwrap()
+        {
+            crate::snapshot::SnapshotOutcome::Uploaded { key, .. } => key,
+            other => panic!("expected Uploaded base snapshot, got {other:?}"),
+        };
+        checkpoint_truncate(src.path()).await;
+
+        // Owner A (epoch 1) streams the first batch of writes.
+        seed_rows(src.path(), 1000, 10).await;
+        {
+            let seam = CoreWalSeam::open(src.path()).unwrap();
+            let cfg = StreamConfig {
+                base_snapshot_key: &base_key,
+                epoch: 1,
+                owner: Some("node-a"),
+                ..cfg()
+            };
+            let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+            assert!(
+                matches!(
+                    out,
+                    StreamOutcome::Streamed { .. } | StreamOutcome::Restarted { .. }
+                ),
+                "owner A should have streamed, got {out:?}"
+            );
+        }
+
+        // Ownership transfers. Owner B (epoch 2) picks up where A stopped.
+        seed_rows(src.path(), 2000, 15).await;
+        {
+            let seam = CoreWalSeam::open(src.path()).unwrap();
+            let cfg = StreamConfig {
+                base_snapshot_key: &base_key,
+                epoch: 2,
+                owner: Some("node-b"),
+                ..cfg()
+            };
+            let out = tail_frames(&seam, &target, &cfg).await.unwrap();
+            assert!(
+                matches!(
+                    out,
+                    StreamOutcome::Streamed { .. } | StreamOutcome::Restarted { .. }
+                ),
+                "owner B should have streamed, got {out:?}"
+            );
+        }
+
+        let outcome = restore_latest_stream(&target, dest.path()).await.unwrap();
+        assert_eq!(outcome.base_snapshot_key, base_key);
+        assert_eq!(outcome.epoch, 2, "restore reports the most recent owner");
+        assert_eq!(
+            count_rows(dest.path()).await,
+            75,
+            "50 (base) + 10 (owner A) + 15 (owner B)"
+        );
+    }
+
+    // ── R732-T3 (W245): the watermark advance is a compare-and-swap ───────
+
+    /// Bootstrapping a fresh sink uses `PutMode::Create`, so two writers
+    /// racing to claim a brand-new tenant cannot both succeed. Without this
+    /// the very first write — the one with no prior version to swap on —
+    /// would be the one unguarded moment in the whole protocol.
+    #[tokio::test]
+    async fn a_second_bootstrap_of_a_fresh_sink_is_contended() {
+        let target = fresh_target();
+        let key = target.watermark_key();
+        let w = Watermark { checkpoint_seq: 0, last_frame: 1 };
+        assert_eq!(
+            write_watermark(&target.store, &key, w, 1, 0, None).await.unwrap(),
+            WatermarkCas::Advanced
+        );
+        assert_eq!(
+            write_watermark(&target.store, &key, w, 1, 0, None).await.unwrap(),
+            WatermarkCas::Contended,
+            "the sink already exists — Create must not silently overwrite it"
+        );
+    }
+
+    /// An advance is conditional on the version actually read. A writer
+    /// holding a version somebody else has already replaced loses.
+    #[tokio::test]
+    async fn an_advance_on_a_replaced_version_is_contended() {
+        let target = fresh_target();
+        let key = target.watermark_key();
+        write_watermark(
+            &target.store,
+            &key,
+            Watermark { checkpoint_seq: 0, last_frame: 1 },
+            1,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Our writer reads the sidecar and holds onto that version…
+        let stale = read_watermark(&target.store, &key).await.unwrap().unwrap();
+        // …while somebody else advances it out from under us.
+        write_watermark(
+            &target.store,
+            &key,
+            Watermark { checkpoint_seq: 0, last_frame: 5 },
+            2,
+            0,
+            read_watermark(&target.store, &key)
+                .await
+                .unwrap()
+                .unwrap()
+                .version
+                .as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            write_watermark(
+                &target.store,
+                &key,
+                Watermark { checkpoint_seq: 0, last_frame: 2 },
+                1,
+                0,
+                stale.version.as_ref(),
+            )
+            .await
+            .unwrap(),
+            WatermarkCas::Contended,
+            "the stale version must not be allowed to overwrite the newer one"
+        );
+        // And the sink still names the winner, not us.
+        let now = read_watermark(&target.store, &key).await.unwrap().unwrap();
+        assert_eq!((now.epoch, now.watermark.last_frame), (2, 5));
+    }
+
+    /// Re-reading before advancing works: the point is the version, not the
+    /// identity of the writer.
+    #[tokio::test]
+    async fn an_advance_on_the_current_version_succeeds() {
+        let target = fresh_target();
+        let key = target.watermark_key();
+        write_watermark(
+            &target.store,
+            &key,
+            Watermark { checkpoint_seq: 0, last_frame: 1 },
+            1,
+            0,
+            None,
+        )
+        .await
+        .unwrap();
+        let cur = read_watermark(&target.store, &key).await.unwrap().unwrap();
+        assert_eq!(
+            write_watermark(
+                &target.store,
+                &key,
+                Watermark { checkpoint_seq: 0, last_frame: 7 },
+                1,
+                0,
+                cur.version.as_ref(),
+            )
+            .await
+            .unwrap(),
+            WatermarkCas::Advanced
+        );
+    }
+
+    /// A store that lets a test slip a competing writer in between our read
+    /// of the watermark and our conditional write of it — the interleaving
+    /// that a sequential epoch check cannot catch and the CAS must.
+    ///
+    /// On the first `put_opts` aimed at the watermark key it writes a rival
+    /// sidecar (at `rival_epoch`) straight through to the inner store, then
+    /// forwards our conditional put, which now finds a version it does not
+    /// hold.
+    struct RacingStore {
+        inner: Arc<dyn ObjectStore>,
+        watermark: ObjPath,
+        rival_epoch: u64,
+        /// R736-T2: the rival's pointer generation, so the same interleaving
+        /// can be exercised for the cross-cell fence too.
+        rival_pointer_generation: u64,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    impl std::fmt::Display for RacingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RacingStore({})", self.inner)
+        }
+    }
+    impl std::fmt::Debug for RacingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RacingStore({:?})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for RacingStore {
+        async fn put_opts(
+            &self,
+            location: &ObjPath,
+            payload: object_store::PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if location == &self.watermark
+                && !self
+                    .fired
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                let rival =
+                    format!("0 99 1 {} {}\n", self.rival_epoch, self.rival_pointer_generation);
+                self.inner
+                    .put(location, rival.into_bytes().into())
+                    .await?;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjPath,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &ObjPath,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures_util::stream::BoxStream<'static, object_store::Result<ObjPath>>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<ObjPath>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjPath>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &ObjPath,
+            to: &ObjPath,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn racing_target(rival_epoch: u64) -> BackupTarget {
+        racing_target_at(rival_epoch, 0)
+    }
+
+    /// R736-T2: like `racing_target`, but also names the rival's pointer
+    /// generation.
+    fn racing_target_at(rival_epoch: u64, rival_pointer_generation: u64) -> BackupTarget {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = "backups".to_string();
+        let watermark = join_key(&prefix, "latest.stream-watermark");
+        BackupTarget {
+            store: Arc::new(RacingStore {
+                inner,
+                watermark,
+                rival_epoch,
+                rival_pointer_generation,
+                fired: std::sync::atomic::AtomicBool::new(false),
+            }),
+            prefix,
+        }
+    }
+
+    /// The race the sequential check cannot see: a newer owner claims the
+    /// sink *after* we read it and *before* we write it. The CAS catches it,
+    /// and we report Fenced without publishing a manifest — which is why the
+    /// manifest write had to move after the watermark advance.
+    #[tokio::test]
+    async fn losing_the_watermark_race_to_a_newer_owner_fences_us_before_we_publish() {
+        let target = racing_target(9);
+        let seam = MockWal::new(4096);
+        for i in 1..=2u32 {
+            seam.append(i, i, i as u8);
+        }
+        let out = tail_frames(&seam, &target, &cfg_at_epoch(4, Some("node-loser")))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            StreamOutcome::Fenced {
+                current_epoch: 9,
+                our_epoch: 4,
+                current_pointer_generation: 0,
+                our_pointer_generation: 0,
+            }
+        );
+
+        // No manifest published — the chain stays clean, so restore is not
+        // poisoned by a regressed generation from a writer that lost.
+        assert!(
+            list_and_parse_generation_manifests(&target)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a writer that loses the CAS must publish nothing"
+        );
+        // The rival's sidecar survived untouched.
+        let now = read_watermark(&target.store, &target.watermark_key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(now.epoch, 9);
+    }
+
+    /// R736-T2: the same race, but the rival is a different cell claiming the
+    /// tenant via a pointer CAS — our epoch is unchanged (we were never told
+    /// to step down locally) but the generation moved under us mid-write.
+    #[tokio::test]
+    async fn losing_the_watermark_race_to_a_cross_cell_move_fences_us_before_we_publish() {
+        let target = racing_target_at(4, 2);
+        let seam = MockWal::new(4096);
+        for i in 1..=2u32 {
+            seam.append(i, i, i as u8);
+        }
+        let out = tail_frames(&seam, &target, &cfg_at(4, 1, Some("cell-a/node-loser")))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            StreamOutcome::Fenced {
+                current_epoch: 4,
+                our_epoch: 4,
+                current_pointer_generation: 2,
+                our_pointer_generation: 1,
+            },
+            "an unchanged epoch must not mask a generation that moved under us"
+        );
+        assert!(
+            list_and_parse_generation_manifests(&target)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a writer that loses the CAS on generation must publish nothing"
+        );
+    }
+
+    /// Losing the race to a writer at our own epoch is NOT a fencing event —
+    /// it means two streamers were handed the same token. That is a caller
+    /// bug and must surface as a loud error, never be retried into success.
+    #[tokio::test]
+    async fn losing_the_race_to_an_equal_epoch_writer_is_a_loud_error() {
+        let target = racing_target(4);
+        let seam = MockWal::new(4096);
+        seam.append(1, 1, 1);
+        let err = tail_frames(&seam, &target, &cfg_at_epoch(4, None))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("two streamers share one fencing token"),
+            "err was {msg}"
+        );
+    }
+
     /// Generation manifest round-trip and rejection of garbage.
     #[test]
     fn manifest_round_trip_and_rejection() {
@@ -2359,6 +4743,9 @@ mod tests {
             checkpoint_seq: 7,
             first_frame: 12,
             last_frame: 34,
+            epoch: 0,
+            owner: None,
+            frame_batches: &[],
         });
         let parsed = parse_generation_manifest(&text).unwrap();
         assert_eq!(parsed.base_snapshot_key, "backups/snapshots/snapshot-1.db");

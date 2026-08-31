@@ -20,7 +20,9 @@
 //!   required field on `StreamConfig`. The drain loop
 //!   (`stream::drain_frames_with_backpressure`) reads WAL frames into a
 //!   `VecDeque` bounded at `spill_buffer_frames`; once full it must resolve
-//!   the head frame before reading further. A throttling-shaped `put` error
+//!   what it has buffered before reading further — since R761-F2 that is one
+//!   `put` of the whole buffer as a ranged batch object, not one put per
+//!   frame, so the bound sizes the largest object too. A throttling `put` error
 //!   retries with backoff (`put_with_backoff`); `Block` never gives up on a
 //!   throttling error (bubbles instantly on any non-throttling error, same
 //!   as `Fail`/`Shed`); `Fail`/`Shed` give up after `backoff.max_retries`.
@@ -95,7 +97,8 @@ pub enum BackpressurePolicy {
 }
 
 /// Exponential backoff parameters for retrying a throttled (429/503-shaped)
-/// R2 `put`. Applied per-frame inside the drain loop.
+/// R2 `put`. Applied per batch object inside the drain loop (per frame,
+/// before R761-F2 made the two the same thing).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BackoffConfig {
     /// Delay before the first retry.
@@ -139,7 +142,14 @@ impl BackoffConfig {
 pub struct BackpressureConfig {
     /// Max frames buffered in memory — read from the WAL but not yet
     /// confirmed uploaded — before the overflow policy applies. Once full,
-    /// the drain loop must resolve the head frame before reading further.
+    /// the drain loop must resolve the buffered frames before reading further.
+    ///
+    /// R761-F2: those frames go up as ONE batch object, so this also caps the
+    /// largest object the sink writes at `spill_buffer_frames * (24 +
+    /// page_size)` — ~1 MB at this default and a 4 KB page. Raising it trades
+    /// memory and per-object retry cost for fewer Class A ops on a
+    /// heavy-writing tenant; lowering it to `1` restores one PUT per frame
+    /// (under the batch key shape, not the pre-R761-F2 one).
     pub spill_buffer_frames: usize,
     pub policy: BackpressurePolicy,
     pub backoff: BackoffConfig,
@@ -253,6 +263,11 @@ pub(crate) mod fault_injection {
     pub(crate) enum Fault {
         TooManyRequests,
         ServiceUnavailable,
+        /// Let this one put through untouched. Only useful positionally — it
+        /// is how a test says "fail the SECOND upload", which is the shape
+        /// every partial-progress scenario needs (R761-F2: a drain that lands
+        /// some batch objects and then gets stuck).
+        Pass,
     }
 
     #[derive(Debug)]
@@ -301,7 +316,7 @@ pub(crate) mod fault_injection {
             opts: PutOptions,
         ) -> OsResult<PutResult> {
             let next = self.faults.lock().unwrap().pop_front();
-            if let Some(fault) = next {
+            if let Some(fault) = next.filter(|f| *f != Fault::Pass) {
                 let msg: &'static str = match fault {
                     Fault::TooManyRequests => {
                         "HTTP status client error (429 Too Many Requests) for url"
@@ -309,6 +324,7 @@ pub(crate) mod fault_injection {
                     Fault::ServiceUnavailable => {
                         "HTTP status server error (503 Service Unavailable) for url"
                     }
+                    Fault::Pass => unreachable!("filtered out above"),
                 };
                 return Err(OsError::Generic {
                     store: "faulty-test-store",

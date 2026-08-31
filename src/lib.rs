@@ -4,10 +4,22 @@
 //!
 //! Plan + findings: `.yah/docs/working/turso-s3-backup.md`
 //!
-//! Three tiers (see modules):
-//! - [`snapshot`] — Tier 1a: full `VACUUM INTO` snapshot → object store (today).
+//! Three tiers (see modules), all three implemented:
+//! - [`snapshot`] — Tier 1a: full `VACUUM INTO` snapshot → object store, behind
+//!   a two-gate skip. [`snapshot::upload_base_snapshot`] publishes an image the
+//!   caller already holds, for a caller that may not open the file itself.
 //! - [`dedup`]    — Tier 1b: incremental page-dedup snapshot.
-//! - [`stream`]   — Tier 2: WAL-frame streaming (deferred, engine-coupled).
+//! - [`stream`]   — Tier 2: WAL-frame streaming anchored to a 1a base, with
+//!   restore by frame replay, an RPO watermark, two-level fencing, bounded
+//!   spill backpressure ([`backpressure`]), one-puller-per-box fan-out
+//!   ([`puller`]), and a [`stream::probe_conditional_puts`] preflight.
+//!
+//! This header called tier 2 "deferred, engine-coupled" until 2026-08-28. It
+//! was neither by then: `stream.rs` had shipped in R005-F2/F3 and grown fencing
+//! (R732-F2), the RPO watermark (R574-T4) and frame batching (R761-F2). The
+//! claim was disproved by R760-F6 while wiring roadcase onto it, and corrected
+//! here rather than filed — a stale doc comment costs every reader after it the
+//! same wrong first impression.
 //!
 //! @yah:relay(Q002, "Turso → S3 backup crate")
 //! @yah:at(2026-05-26T22:28:29Z)

@@ -1,4 +1,4 @@
-//! `turso-backup-rss-harness` — the §8 capacity measurement: open N Turso
+//! `rss_harness` (example) — the §8 capacity measurement: open N Turso
 //! DBs, attach a warm-applier connection to each, stream WAL through it, and
 //! record the process RSS after every step.
 //!
@@ -36,8 +36,8 @@
 //!    and Linux prod nodes with zero new dependency (no `/proc` on Darwin,
 //!    no `getrusage` binding in this crate's deps).
 //!
-//! Deliberately **not** a `#[test]`/bench target: like
-//! [`crate::snapshot`]'s CLI bin, this wants to be a clean, killable process
+//! Deliberately **not** a `#[test]`/bench target: like the
+//! `turso-backup-snapshot` CLI bin, this wants to be a clean, killable process
 //! (an OOM or FD exhaustion at DB #400 shouldn't take out `cargo test`), and
 //! a human watching the curve live (or piping it to a file) is the point.
 //!
@@ -49,8 +49,8 @@
 //! ## Running
 //!
 //! ```text
-//! cargo run -p turso-backup --bin turso-backup-rss-harness
-//! RSS_HARNESS_MAX_DBS=100 RSS_HARNESS_ROWS=200 cargo run -p turso-backup --bin turso-backup-rss-harness
+//! cargo run -p turso-backup --release --example rss_harness
+//! RSS_HARNESS_MAX_DBS=100 RSS_HARNESS_ROWS=200 cargo run -p turso-backup --release --example rss_harness
 //! ```
 //!
 //! Env overrides (all optional):
@@ -144,6 +144,9 @@ async fn main() -> Result<()> {
                 page_size: PAGE_SIZE,
                 backpressure: turso_backup::backpressure::BackpressureConfig::default(),
                 rpo_target: None,
+                epoch: 0,
+                owner: None,
+                pointer_generation: 0,
             };
             tail_frames(&seam, &target, &cfg)
                 .await

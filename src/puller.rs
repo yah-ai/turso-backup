@@ -9,7 +9,7 @@
 //! O(boxes), not O(replicas).
 //!
 //! Depends on R574-T1's §8 RSS curve (this crate's own
-//! `turso-backup-rss-harness`): the untrimmed measured slope was ~86
+//! `rss_harness` example): the untrimmed measured slope was ~86
 //! KB/replica, which is what justifies keeping hundreds of `CoreWalSeam`
 //! appliers resident per box in the first place — [`WalPullerConfig`]'s FD
 //! budget defaults straight off that number. Trimming (below) is this
@@ -85,12 +85,10 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use object_store::ObjectStoreExt;
-
 use crate::snapshot::BackupTarget;
 use crate::stream::{
-    list_and_parse_generation_manifests, validate_generation_chain, CoreWalSeam, WalInsertSeam,
-    Watermark, WAL_FRAME_HEADER_SIZE,
+    for_each_frame_in_generation, list_and_parse_generation_manifests, validate_generation_chain,
+    CoreWalSeam, WalInsertSeam, Watermark,
 };
 
 /// A [`WalInsertSeam`] plus the one extra call a warm standby needs: trim
@@ -332,42 +330,34 @@ impl<'a> WalPuller<'a> {
             });
         }
 
-        let frame_size = WAL_FRAME_HEADER_SIZE + self.page_size;
         let mut frames_pulled = 0u64;
         let mut last_frame_no = start_frame - 1;
+        let appliers = &self.appliers;
         for m in &manifests {
             if m.last_frame < start_frame {
                 continue; // fully covered by a prior pull_once() call
             }
-            let first = m.first_frame.max(start_frame);
-            for frame_no in first..=m.last_frame {
-                let key = self.target.frame_key(m.checkpoint_seq, frame_no);
-                let bytes = self
-                    .target
-                    .store
-                    .get(&key)
-                    .await
-                    .with_context(|| format!("fetching frame {key}"))?
-                    .bytes()
-                    .await
-                    .with_context(|| format!("reading frame body {key}"))?;
-                anyhow::ensure!(
-                    bytes.len() == frame_size,
-                    "frame {key} is {} bytes, expected {frame_size} (24 header + {} page)",
-                    bytes.len(),
-                    self.page_size,
-                );
-                for (applier_name, applier) in self.appliers.iter() {
-                    applier
-                        .seam
-                        .wal_insert_frame(frame_no, &bytes)
-                        .with_context(|| {
+            // R732-F2: the epoch comes from each manifest, not from the chain,
+            // so a pull spanning an ownership transfer still finds both
+            // owners' frames under their own key prefixes. R761-F2: and the
+            // manifest also says whether they are batched, so a pull spanning
+            // the layout change finds both shapes — all of that is
+            // `for_each_frame_in_generation`'s business, not this loop's.
+            frames_pulled += for_each_frame_in_generation(
+                self.target,
+                m,
+                start_frame,
+                |frame_no, bytes| {
+                    for (applier_name, applier) in appliers.iter() {
+                        applier.seam.wal_insert_frame(frame_no, bytes).with_context(|| {
                             format!("fanning frame {frame_no} to applier {applier_name:?}")
                         })?;
-                }
-                frames_pulled += 1;
-                last_frame_no = frame_no;
-            }
+                    }
+                    last_frame_no = frame_no;
+                    Ok(())
+                },
+            )
+            .await?;
         }
         self.pulled = Some(Watermark {
             checkpoint_seq: chain.checkpoint_seq,
@@ -386,7 +376,7 @@ mod tests {
     use super::*;
     use crate::backpressure::BackpressureConfig;
     use crate::snapshot::BackupTarget;
-    use crate::stream::{tail_frames, FrameInfo, StreamConfig, WalSeam};
+    use crate::stream::{tail_frames, FrameInfo, StreamConfig, WalSeam, WAL_FRAME_HEADER_SIZE};
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjPath;
     use object_store::{
@@ -413,6 +403,9 @@ mod tests {
             page_size: 4096,
             backpressure: BackpressureConfig::default(),
             rpo_target: None,
+            epoch: 0,
+            owner: None,
+            pointer_generation: 0,
         }
     }
 
@@ -690,8 +683,9 @@ mod tests {
     // --- pull_once: single download, fan-out, resumability -----------------
 
     /// Core fan-in property: N frames staged, M appliers attached — the
-    /// object store sees exactly N+1 `get` calls (N frames + 1 generation
-    /// manifest listing/fetch), not N*M.
+    /// object store sees a fixed number of `get` calls that does not scale
+    /// with M. Since R761-F2 it does not scale with N either: the whole tail
+    /// call is one batch object, so three frames cost one GET, not three.
     #[tokio::test]
     async fn pull_once_downloads_each_frame_once_regardless_of_applier_count() {
         let seam = MockWal::new();
@@ -711,7 +705,11 @@ mod tests {
         let report = puller.pull_once().await.unwrap();
         assert_eq!(report.frames_pulled, 3);
         assert_eq!(report.appliers_fanned, 3);
-        assert_eq!(counting.get_count(), 4, "3 frames + 1 generation manifest, once each");
+        assert_eq!(
+            counting.get_count(),
+            2,
+            "1 batch object holding all 3 frames + 1 generation manifest, once each"
+        );
     }
 
     /// Every attached applier receives the identical frame content and
@@ -927,6 +925,9 @@ mod tests {
                 page_size: 4096,
                 backpressure: BackpressureConfig::default(),
                 rpo_target: None,
+                epoch: 0,
+                owner: None,
+                pointer_generation: 0,
             };
             tail_frames(&seam, &target, &cfg).await.unwrap();
         }

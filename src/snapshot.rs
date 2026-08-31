@@ -184,6 +184,52 @@ pub async fn snapshot_and_upload(db_path: &str, target: &BackupTarget) -> Result
     })
 }
 
+/// Publish an already-materialized database image as a tier-1a snapshot,
+/// without opening the source database at all.
+///
+/// [`snapshot_and_upload`] is the right entry point when this process may open
+/// `db_path` freely. Two kinds of caller cannot:
+///
+/// - One that already holds the only permitted handle on the file. roadcase's
+///   residency ladder is the example: `turso_core::Database::open_file_with_flags`
+///   consults a **process-global registry keyed by file id** before it reads the
+///   open flags, so a second opener gets the first one's handle back with its
+///   own flags discarded. Such a caller has a live `turso_core::Connection` and
+///   must produce the image through it.
+/// - One that needs the snapshot to be *page-compatible* with the WAL frames
+///   [`crate::stream::tail_frames`] will upload next. `VACUUM INTO` repacks the
+///   database, so its output is a valid SQLite file but not necessarily the
+///   same page layout the engine will number subsequent frames against. The
+///   image a tier-2 base wants is the main database file itself, read after a
+///   `PRAGMA wal_checkpoint(TRUNCATE)` has emptied the WAL into it.
+///
+/// Writes one object under the same `snapshots/snapshot-{unix_nanos:020}.db`
+/// layout [`snapshot_and_upload`] uses, so [`restore_latest`] finds it and
+/// [`crate::stream::StreamConfig::base_snapshot_key`] can name it. Returns that
+/// key.
+///
+/// Deliberately writes **neither fingerprint sidecar.** Both gate
+/// `snapshot_and_upload`, and this path has hashed no source files — recording
+/// a `latest.source-fingerprint` here would assert a correspondence between an
+/// object and a set of file bytes that was never checked, which is the one
+/// thing that could make the two-gate skip drop a real backup.
+pub async fn upload_base_snapshot(target: &BackupTarget, image: &[u8]) -> Result<String> {
+    anyhow::ensure!(
+        image.starts_with(b"SQLite format 3\0"),
+        "refusing to publish a base snapshot that is not a SQLite database \
+         ({} bytes, prefix {:?})",
+        image.len(),
+        &image[..image.len().min(16)],
+    );
+    let key = target.snapshot_key(unix_nanos());
+    target
+        .store
+        .put(&key, image.to_vec().into())
+        .await
+        .with_context(|| format!("uploading base snapshot to {key}"))?;
+    Ok(key.to_string())
+}
+
 /// SHA-256 of the source database files: the main `.db` plus its `-wal`
 /// sidecar if present (WAL-mode commits live there until a checkpoint). A
 /// quiescent database hashes identically on re-read; any committed write

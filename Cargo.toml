@@ -1,8 +1,13 @@
 [package]
 name = "turso-backup"
-version = "0.8.22"
+version = "0.8.29"
 edition = "2021"
-publish = false
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/turso-backup"
+description = "Turso/libSQL WAL-tailing snapshot and S3-compatible backup sink: periodic snapshot_and_upload plus a raw WAL frame streamer via turso_core's conn_raw_api."
+keywords = ["turso", "sqlite", "backup", "s3"]
+categories = ["database"]
 
 # Tier 1a sibling crate shape: depends on turso via crates.io (no re-exports),
 # uses object_store for S3-compatible upload/download. Async via tokio.
@@ -10,13 +15,14 @@ publish = false
 # Backing doc: .yah/docs/working/turso-s3-backup.md
 
 [dependencies]
-turso = "0.6.1"
+# Bumped 0.6.1 -> 0.7.2 in R830 (0.6.1 loses writes behind a live Rows).
+turso = "0.7.2"
 # Tier 2 raw WAL seam (wal_state / wal_get_frame / wal_auto_actions_disable /
 # wal_insert_*) lives on turso_core::Connection behind feature='conn_raw_api'.
 # The friendly `turso` wrapper does NOT re-export it (R005-T1 finding), so we
-# take a sibling dep pinned in lockstep with turso=0.6.1. If versions drift,
+# take a sibling dep pinned in lockstep with turso=0.7.2. If versions drift,
 # cargo will refuse a duplicate transitive; bump both together.
-turso_core = { version = "0.6.1", features = ["conn_raw_api"] }
+turso_core = { version = "0.7.2", features = ["conn_raw_api"] }
 # `aws` feature: needed by the `turso-backup-snapshot` bin to build an
 # AmazonS3-shaped store from env vars. The library API stays
 # backend-agnostic (Arc<dyn ObjectStore>); pulling `aws` in here just lets
@@ -33,12 +39,23 @@ tokio = { version = "1", features = ["rt", "macros", "time"] }
 sha2 = "0.10"
 hex = "0.4"
 
-# R574-F2 test-only fake R2 client (backpressure::fault_injection::FaultyStore)
-# implements object_store::ObjectStore directly so tests can inject 429/503
-# without a real endpoint. Both are already resolved transitively via
-# object_store itself (async-trait backs its own `#[async_trait]` trait def;
-# futures-util backs its `BoxStream` methods) — pinned here at the same
-# already-locked majors, not a new crate entering the graph.
+# Test/example-only fake object stores. Three of them exist —
+# R574-F2's `backpressure::fault_injection::FaultyStore` (injects 429/503
+# without a real endpoint), stream.rs / puller.rs's counting wrappers, and
+# the tail-sweep harness's `CountingStore` — and each implements
+# `object_store::ObjectStore` directly. That trait is itself
+# `#[async_trait]`, so an outside impl needs the same macro, and its
+# `list`/`delete_stream` methods are typed in terms of
+# `futures_util::stream::BoxStream`.
+#
+# R761-T3: these were briefly REAL dependencies, because the tail-sweep
+# harness was a [[bin]] and `[[bin]]` targets cannot see
+# `[dev-dependencies]`. The harnesses are examples now (examples *can* see
+# dev-dependencies, and a measurement harness belongs there), so the
+# declared dependency surface of the published crate no longer carries a
+# measurement binary's needs. Nothing left as a real dep uses either crate:
+# every `async_trait` / `futures_util` use in `src/` is inside a
+# `#[cfg(test)]` module.
 [dev-dependencies]
 async-trait = "0.1"
 futures-util = "0.3"
@@ -50,10 +67,32 @@ futures-util = "0.3"
 name = "turso-backup-snapshot"
 path = "src/bin/snapshot.rs"
 
+# The two measurement harnesses are EXAMPLES, not bins (R761-T3). They are
+# development instruments, not shipped entry points, and examples can see
+# `[dev-dependencies]` — which is what keeps async-trait / futures-util out
+# of the published crate's real dependency surface. `test = true` (not the
+# default for examples) so their unit tests keep running under `cargo test`,
+# exactly as they did while they were bins.
+
 # §8 capacity measurement: open N Turso DBs, attach a warm-applier
 # connection to each, stream WAL through it, and print an NDJSON RSS-vs-
 # db-count curve (slope = per-replica memory cost, intercept = engine
 # baseline). R574-T1; see rss_harness.rs module doc + W253 §8.
-[[bin]]
-name = "turso-backup-rss-harness"
-path = "src/bin/rss_harness.rs"
+# Run: cargo run -p turso-backup --release --example rss_harness
+[[example]]
+name = "rss_harness"
+path = "examples/rss_harness.rs"
+test = true
+
+# W313 §9(0): sweeps the tail-call interval (writes_per_tail) against a
+# casual-app workload (many small single-row transactions into a table with
+# a secondary index) and reports frames/write and PUTs/write, classified by
+# object-store key prefix, plus a $/cell/month projection at R2 Class A
+# pricing — the measurement §3.1's ~4x-over-storage estimate needed before
+# any frame-batching layout change is decided. See tail_sweep_harness.rs
+# module doc.
+# Run: cargo run -p turso-backup --example tail_sweep_harness
+[[example]]
+name = "tail_sweep_harness"
+path = "examples/tail_sweep_harness.rs"
+test = true

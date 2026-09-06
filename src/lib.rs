@@ -45,3 +45,9 @@ pub mod dedup;
 pub mod stream;
 pub mod backpressure;
 pub mod puller;
+/// R850-F1: mints the fencing epoch `stream::StreamConfig::epoch` enforces, for
+/// callers with no raft state machine to ask.
+pub mod claim;
+/// R850-F1: hydrate-on-place — fill an empty volume's declared databases from
+/// the store before the workload starts, under a [`claim`].
+pub mod hydrate;

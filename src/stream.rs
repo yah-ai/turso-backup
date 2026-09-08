@@ -1541,6 +1541,55 @@ pub async fn list_and_parse_generation_manifests(
     Ok(manifests)
 }
 
+/// What the sink's fence currently stands at — the two comparands
+/// [`tail_frames`] checks a writer against, and nothing else.
+///
+/// R869: this is the off-fleet copy of a fencing token. It matters because
+/// `epoch` is minted by a raft group, and a raft group can be *destroyed* —
+/// wipe the raft dir, re-form, and the fresh cluster's first
+/// `ClaimTenant` grants epoch 1 while this sidecar still says 5, so the
+/// rebuilt cluster is fenced out of its own sink. Reading the fence back is how
+/// a rebuild starts above the number its dead predecessor left here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FenceState {
+    /// The fencing epoch of the writer that last advanced the sidecar. `0`
+    /// means "unfenced" — either nothing has claimed this sink or it predates
+    /// R732-F2 — and fences nobody.
+    pub epoch: u64,
+    /// The pointer generation of that same writer. `0` means unfenced, exactly
+    /// as for `epoch`.
+    pub pointer_generation: u64,
+}
+
+/// Read the fence [`tail_frames`] would check a writer against, without writing
+/// anything or needing a WAL.
+///
+/// `Ok(None)` means the sidecar does not exist: nothing has ever streamed to
+/// this prefix, so **there is no fence here at all** and any writer is
+/// accepted. Do not collapse that into `FenceState::default()` at a call site
+/// that is deciding whether to fence — "unfenced because nobody has written"
+/// and "unfenced because an old writer stamped 0" are the same *value* but a
+/// caller that cares about the difference (a rebuild deciding whether a tenant
+/// was ever live) needs the `Option`.
+///
+/// **A floor derived from `epoch` is a lower bound, not an upper one.** It is
+/// the highest epoch anyone has *written under*, which is not the highest a
+/// dead raft group *granted* — a tenant claimed twice while idle leaves a node
+/// holding an epoch strictly above anything this sidecar ever saw. So a rebuild
+/// that seeds from this number closes availability (its own writes are
+/// accepted) and does **not** on its own fence a resurrected node; that takes
+/// `pointer_generation`, which is minted off-fleet where a dead cluster cannot
+/// reach it. `oss/yubaba/crates/yubaba/tests/raft_rebuild_fencing.rs` drives
+/// both halves against this code.
+pub async fn read_fence_state(target: &BackupTarget) -> Result<Option<FenceState>> {
+    Ok(read_watermark(&target.store, &target.watermark_key())
+        .await?
+        .map(|p| FenceState {
+            epoch: p.epoch,
+            pointer_generation: p.pointer_generation,
+        }))
+}
+
 /// In-memory shape of a generation manifest. Format on disk:
 ///
 /// ```text
@@ -4073,6 +4122,88 @@ mod tests {
         let legacy = read_watermark(&target.store, &key).await.unwrap().unwrap();
         assert_eq!(legacy.epoch, 6);
         assert_eq!(legacy.pointer_generation, 0, "a pre-R736-T2 sidecar fences nobody on generation");
+    }
+
+    /// R869: `read_fence_state` reports exactly the two comparands
+    /// [`tail_frames`] checks — including the pre-fencing sidecar shapes, which
+    /// must read back as unfenced rather than erroring, since a rebuild will
+    /// meet them on any sink written before R732-F2.
+    #[tokio::test]
+    async fn read_fence_state_reports_what_tail_frames_would_check() {
+        let target = fresh_target();
+        assert_eq!(
+            read_fence_state(&target).await.unwrap(),
+            None,
+            "no sidecar means no fence at all, which is not the same as a zero fence"
+        );
+
+        write_watermark(
+            &target.store,
+            &target.watermark_key(),
+            Watermark {
+                checkpoint_seq: 2,
+                last_frame: 11,
+            },
+            6,
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_fence_state(&target).await.unwrap(),
+            Some(FenceState {
+                epoch: 6,
+                pointer_generation: 3
+            })
+        );
+
+        // A two-field sidecar — the original pre-fencing shape. Both comparands
+        // read back 0, so a rebuild sees "unfenced" rather than a parse error.
+        target
+            .store
+            .put(&target.watermark_key(), b"2 11\n".to_vec().into())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_fence_state(&target).await.unwrap(),
+            Some(FenceState::default())
+        );
+    }
+
+    /// The property a rebuild's epoch floor rests on, stated as a test rather
+    /// than as a comment: seeding one above `read_fence_state().epoch` is
+    /// exactly enough to stop being fenced, and one *below* it is not.
+    #[tokio::test]
+    async fn a_floor_taken_from_read_fence_state_is_what_unfences_a_rebuild() {
+        let target = fresh_target();
+        let seam = MockWal::new(4096);
+        for i in 1..=3u32 {
+            seam.append(i, i, i as u8);
+        }
+        tail_frames(&seam, &target, &cfg_at_epoch(5, Some("dead-fleet")))
+            .await
+            .unwrap();
+
+        let fence = read_fence_state(&target).await.unwrap().unwrap();
+        assert_eq!(fence.epoch, 5);
+
+        // A rebuilt cluster that restarted its epochs at 1 is refused.
+        seam.append(4, 4, 4);
+        let out = tail_frames(&seam, &target, &cfg_at_epoch(1, Some("rebuilt")))
+            .await
+            .unwrap();
+        assert!(matches!(out, StreamOutcome::Fenced { .. }), "got {out:?}");
+
+        // Seeded from the fence, it is not.
+        let out = tail_frames(
+            &seam,
+            &target,
+            &cfg_at_epoch(fence.epoch + 1, Some("rebuilt")),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, StreamOutcome::Streamed { .. }), "got {out:?}");
     }
 
     /// The same owner resuming at the same epoch is NOT fenced — fencing is

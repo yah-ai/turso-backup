@@ -1,6 +1,6 @@
 [package]
 name = "turso-backup"
-version = "0.8.33"
+version = "0.8.34"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
@@ -103,3 +103,14 @@ test = true
 name = "tail_sweep_harness"
 path = "examples/tail_sweep_harness.rs"
 test = true
+
+# R858-S6: measures what a turso-backup stream does when the WAL is written AND
+# CHECKPOINTED by an upstream C SQLite process (headscale's Go driver is the
+# motivating case). Shells out to the system `sqlite3` binary as the foreign
+# writer — a turso-driven writer would make the probe circular — and SIGKILLs
+# it, because SQLite checkpoints on a clean close and a naive setup leaves a
+# 0-byte WAL. See the example's module doc.
+# Run: cargo run -p turso-backup --example foreign_checkpoint_probe
+[[example]]
+name = "foreign_checkpoint_probe"
+path = "examples/foreign_checkpoint_probe.rs"

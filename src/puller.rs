@@ -56,11 +56,14 @@
 //!   traffic.
 //! - **A WAL restart mid-fan-out is refused, not patched over** — same
 //!   posture as `restore_latest_stream`'s `validate_generation_chain`
-//!   check. If `pull_once()` observes the source's `checkpoint_seq` change
-//!   from what it already fanned out, every attached applier's WAL already
-//!   contains frames from the *old* sequence that don't compose with the
-//!   new one; the fix is a fresh `restore_latest_stream` + a new
-//!   `WalPuller`, not heroics here.
+//!   check. If `pull_once()` cannot prove the chain is still the WAL
+//!   generation it already fanned out, every attached applier's WAL may
+//!   already contain frames from the *old* one, which don't compose with the
+//!   new; the fix is a fresh `restore_latest_stream` + a new `WalPuller`, not
+//!   heroics here. R858-B19: the test is
+//!   [`crate::stream::WalGeneration::is_provably_same_as`] — salt included —
+//!   not `checkpoint_seq`, which a writer-process restart resets to the value
+//!   it already had. An unrecorded salt on either side counts as not proven.
 //! - **FD/disk budget** ([`WalPullerConfig`]) is enforced at `attach()`
 //!   time: `max_appliers` bounds concurrently-open applier connections (each
 //!   is several FDs — raise the box's ulimit accordingly, per §5), and
@@ -88,7 +91,7 @@ use anyhow::{Context, Result};
 use crate::snapshot::BackupTarget;
 use crate::stream::{
     for_each_frame_in_generation, list_and_parse_generation_manifests, validate_generation_chain,
-    CoreWalSeam, WalInsertSeam, Watermark,
+    CoreWalSeam, WalGeneration, WalInsertSeam, Watermark,
 };
 
 /// A [`WalInsertSeam`] plus the one extra call a warm standby needs: trim
@@ -169,6 +172,11 @@ pub struct WalPuller<'a> {
     /// fanned out to every currently-attached applier. `None` before the
     /// first successful `pull_once()`.
     pulled: Option<Watermark>,
+    /// R858-B19: the WAL generation `pulled.last_frame` is a position within.
+    /// Kept beside the watermark rather than inside it because `Watermark` is
+    /// what `WalSeam::wal_state()` returns, and the engine's `wal_state` does
+    /// not report a salt — see [`crate::stream::WalGeneration`].
+    pulled_generation: Option<WalGeneration>,
 }
 
 impl<'a> WalPuller<'a> {
@@ -180,6 +188,7 @@ impl<'a> WalPuller<'a> {
             appliers: HashMap::new(),
             disk_used_bytes: 0,
             pulled: None,
+            pulled_generation: None,
         }
     }
 
@@ -310,22 +319,29 @@ impl<'a> WalPuller<'a> {
             chain.page_size,
             self.page_size,
         );
-        if let Some(prior) = self.pulled {
+        // R858-B19: same widening as `tail_frames`. This used to compare
+        // `checkpoint_seq` alone, which a writer-process restart resets to 0 —
+        // so a puller would happily fan frames from a brand-new WAL onto
+        // appliers holding the old one's. The test is now "provably the same
+        // generation", and an unrecorded salt on either side counts as NOT
+        // proven: a puller that cannot tell which WAL it is reading must stop,
+        // because its appliers are live replicas, not a re-runnable restore.
+        if let Some(prior) = self.pulled_generation {
             anyhow::ensure!(
-                chain.checkpoint_seq == prior.checkpoint_seq,
-                "WAL restart since the last pull (checkpoint_seq {} -> {}) — attached appliers \
-                 hold frames from the old sequence and can't be trusted to compose with the new \
-                 one; re-materialize them via a fresh restore_latest_stream and start a new \
+                chain.generation.is_provably_same_as(&prior),
+                "WAL restart since the last pull ({} -> {}) — attached appliers \
+                 hold frames from the old WAL generation and can't be trusted to compose with the \
+                 new one; re-materialize them via a fresh restore_latest_stream and start a new \
                  WalPuller",
-                prior.checkpoint_seq,
-                chain.checkpoint_seq,
+                prior.describe(),
+                chain.generation.describe(),
             );
         }
         let start_frame = self.pulled.map(|p| p.last_frame + 1).unwrap_or(1);
         if chain.total_frames < start_frame {
             return Ok(PullReport {
                 frames_pulled: 0,
-                checkpoint_seq: chain.checkpoint_seq,
+                checkpoint_seq: chain.generation.checkpoint_seq,
                 appliers_fanned: self.appliers.len(),
             });
         }
@@ -360,12 +376,13 @@ impl<'a> WalPuller<'a> {
             .await?;
         }
         self.pulled = Some(Watermark {
-            checkpoint_seq: chain.checkpoint_seq,
+            checkpoint_seq: chain.generation.checkpoint_seq,
             last_frame: last_frame_no,
         });
+        self.pulled_generation = Some(chain.generation);
         Ok(PullReport {
             frames_pulled,
-            checkpoint_seq: chain.checkpoint_seq,
+            checkpoint_seq: chain.generation.checkpoint_seq,
             appliers_fanned: self.appliers.len(),
         })
     }

@@ -1,6 +1,6 @@
 [package]
 name = "turso-backup"
-version = "0.8.36"
+version = "0.8.37"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
@@ -74,6 +74,14 @@ path = "src/bin/snapshot.rs"
 name = "turso-backup-hydrate"
 path = "src/bin/hydrate.rs"
 
+# R850-F1 backup side: the long-running sibling of the hydrate bin. A separate
+# process for the same reason — and more so, since this one keeps a database
+# engine RESIDENT for the workload's whole life. Its exit code is the supervisor
+# contract: 2 means another node owns this state, stop the workload.
+[[bin]]
+name = "turso-backup-tail"
+path = "src/bin/tail.rs"
+
 # The two measurement harnesses are EXAMPLES, not bins (R761-T3). They are
 # development instruments, not shipped entry points, and examples can see
 # `[dev-dependencies]` — which is what keeps async-trait / futures-util out
@@ -103,6 +111,16 @@ test = true
 name = "tail_sweep_harness"
 path = "examples/tail_sweep_harness.rs"
 test = true
+
+# R850-F1: decides whether an appliance's WAL tail can run in a process SEPARATE
+# from the application that holds the database open — the question both arms of
+# the backup-side fork depend on. Re-execs itself as a `turso`-crate holder, so
+# unlike foreign_checkpoint_probe (turso vs C SQLite) this is turso on both
+# sides. See the example's module doc.
+# Run: cargo run -p turso-backup --example appliance_tail_probe
+[[example]]
+name = "appliance_tail_probe"
+path = "examples/appliance_tail_probe.rs"
 
 # R858-S6: measures what a turso-backup stream does when the WAL is written AND
 # CHECKPOINTED by an upstream C SQLite process (headscale's Go driver is the

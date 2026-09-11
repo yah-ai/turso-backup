@@ -54,7 +54,7 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use turso::Builder;
+use crate::stream::validated_against_source;
 
 /// Configuration for an object-store backup target (S3 / R2 / MinIO, path-style).
 ///
@@ -230,6 +230,45 @@ pub async fn upload_base_snapshot(target: &BackupTarget, image: &[u8]) -> Result
     Ok(key.to_string())
 }
 
+/// [`upload_base_snapshot`] behind the canonical (gate-2) skip, for a caller
+/// that publishes an image *repeatedly*.
+///
+/// R850-F1. `upload_base_snapshot` is a one-shot: every call writes an object,
+/// which is right for publishing a tier-2 base once and wrong for a tail that
+/// re-snapshots a mostly-idle database every interval forever. This applies the
+/// content hash gate `snapshot_and_upload` calls gate 2 — identical image bytes
+/// to the last publish means skip the upload — and returns
+/// [`SnapshotOutcome::Deduplicated`] when it fires.
+///
+/// It records **only** `latest.snapshot-fingerprint`, never
+/// `latest.source-fingerprint`, for the reason `upload_base_snapshot` gives at
+/// length: this path hashes no source *files*, so claiming a correspondence
+/// between an object and a set of file bytes it never read is the one thing that
+/// could make `snapshot_and_upload`'s cheap gate 1 skip a real backup later.
+/// [`SnapshotOutcome::Unchanged`] is therefore never returned from here.
+pub async fn upload_snapshot_image(
+    target: &BackupTarget,
+    image: &[u8],
+) -> Result<SnapshotOutcome> {
+    let snapshot_hash = sha256_hex(image);
+    let prev = read_text(&target.store, &target.snapshot_fingerprint_key()).await?;
+    if prev.as_deref() == Some(snapshot_hash.as_str()) {
+        return Ok(SnapshotOutcome::Deduplicated { snapshot_hash });
+    }
+    let key = upload_base_snapshot(target, image).await?;
+    put_text(
+        &target.store,
+        &target.snapshot_fingerprint_key(),
+        &snapshot_hash,
+    )
+    .await?;
+    Ok(SnapshotOutcome::Uploaded {
+        key,
+        bytes: image.len(),
+        snapshot_hash,
+    })
+}
+
 /// SHA-256 of the source database files: the main `.db` plus its `-wal`
 /// sidecar if present (WAL-mode commits live there until a checkpoint). A
 /// quiescent database hashes identically on re-read; any committed write
@@ -274,21 +313,53 @@ async fn put_text(store: &Arc<dyn ObjectStore>, key: &ObjPath, text: &str) -> Re
     Ok(())
 }
 
-/// `VACUUM INTO '<temp_path>'` against the turso DB at `db_path`. VACUUM INTO
-/// returns no rows, but turso's `execute` rejects any row-bearing statement, so
-/// we drive it through `query` and drain defensively.
+/// `VACUUM INTO '<temp_path>'` against the database at `db_path`, opened
+/// **read-only** and validated against a concurrent foreign writer.
+///
+/// R858-B18 changed two things here, for one reason: a backup is a reader, and
+/// this was the second of the crate's two source opens that did not say so.
+///
+/// 1. **`turso_core` with `OpenFlags::ReadOnly`, not `turso::Builder`.** The
+///    friendly wrapper exposes no `OpenFlags`, so it opened the source writable
+///    and took turso's whole-file exclusive `fcntl` lock — which is refused
+///    outright when the application that owns the database is running
+///    (measured: `examples/foreign_checkpoint_probe.rs` probe S1, `Locking
+///    error: File is locked by another process`). `ReadOnly` skips that lock per
+///    handle, and `VACUUM INTO` still runs on such a connection (probe S2: 50/50
+///    rows, `integrity_check ok`) — note `VACUUM INTO` is not gated by
+///    `DatabaseOpts::enable_vacuum`, only bare `VACUUM` is
+///    (`turso_core/translate/vacuum.rs:39`).
+/// 2. **Wrapped in [`validated_against_source`].** Opening without a lock is not
+///    coordination: a foreign checkpoint can still land mid-vacuum, and VACUUM
+///    INTO rebuilds the b-tree, so a torn read of the source yields an output
+///    that passes `integrity_check` while holding the wrong rows. Same protocol
+///    as tier 2's copy — accept only if the source provably held still, else
+///    retry, else refuse.
+///
+/// The destination is removed at the start of every attempt, because SQLite
+/// refuses to `VACUUM INTO` a file that already exists and a retried attempt
+/// would otherwise fail on its predecessor's output.
 async fn vacuum_into(db_path: &str, temp_path: &std::path::Path) -> Result<()> {
-    let db = Builder::new_local(db_path)
-        .build()
-        .await
-        .with_context(|| format!("opening turso db {db_path}"))?;
-    let conn = db.connect().context("connecting to turso db")?;
     // Single-quote the path SQLite-style (double any embedded quote).
     let escaped = temp_path.to_string_lossy().replace('\'', "''");
-    let sql = format!("VACUUM INTO '{escaped}'");
-    let mut rows = conn.query(&sql, ()).await.context("VACUUM INTO failed")?;
-    while rows.next().await.context("draining VACUUM INTO")?.is_some() {}
-    Ok(())
+    validated_against_source(db_path, "VACUUM INTO snapshot", || async {
+        let _ = std::fs::remove_file(temp_path);
+        let io: Arc<dyn turso_core::IO> =
+            Arc::new(turso_core::PlatformIO::new().context("creating turso_core PlatformIO")?);
+        let db = turso_core::Database::open_file_with_flags(
+            io,
+            db_path,
+            turso_core::OpenFlags::ReadOnly,
+            turso_core::DatabaseOpts::new(),
+            None,
+        )
+        .with_context(|| format!("opening turso db {db_path} read-only"))?;
+        let conn = db.connect().context("connecting to turso db")?;
+        conn.execute(format!("VACUUM INTO '{escaped}'"))
+            .context("VACUUM INTO failed")?;
+        Ok(())
+    })
+    .await
 }
 
 /// Join an object-store prefix and a leaf into a normalized [`ObjPath`],
@@ -327,37 +398,60 @@ fn unix_nanos() -> u128 {
 /// Errors if no snapshots exist under the prefix yet.
 pub async fn restore_latest(target: &BackupTarget, dest_path: &str) -> Result<String> {
     let snapshots_prefix = join_key(&target.prefix, "snapshots");
+    let newest = latest_snapshot_key(target)
+        .await?
+        .with_context(|| format!("no snapshots found under {snapshots_prefix}"))?;
+
+    let location = ObjPath::from(newest.clone());
+    let bytes = target
+        .store
+        .get(&location)
+        .await
+        .with_context(|| format!("downloading snapshot {location}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("reading snapshot body {location}"))?;
+
+    std::fs::write(dest_path, &bytes)
+        .with_context(|| format!("writing restored snapshot to {dest_path}"))?;
+
+    Ok(newest)
+}
+
+/// The key [`restore_latest`] would download, without downloading it — or `None`
+/// when the prefix holds no snapshot at all.
+///
+/// R850-F1 split this out for the tail side, which needs the *name* of an
+/// existing tier-2 base rather than its bytes: a restarted tail that cannot see
+/// that a base already exists re-copies the whole database on every restart, and
+/// a `None` here is what tells it there is genuinely nothing to anchor to.
+///
+/// Absence is a `None` rather than the `Err` [`restore_latest`] returns because
+/// the two callers want opposite things from it: a restore with no snapshot has
+/// failed, while a first-ever tail with no snapshot is simply first.
+pub async fn latest_snapshot_key(target: &BackupTarget) -> Result<Option<String>> {
+    let snapshots_prefix = join_key(&target.prefix, "snapshots");
     let listing = target
         .store
         .list_with_delimiter(Some(&snapshots_prefix))
         .await
         .with_context(|| format!("listing snapshots under {snapshots_prefix}"))?;
-
-    let newest = listing
+    Ok(listing
         .objects
         .into_iter()
         .max_by(|a, b| a.location.cmp(&b.location))
-        .with_context(|| format!("no snapshots found under {snapshots_prefix}"))?;
-
-    let bytes = target
-        .store
-        .get(&newest.location)
-        .await
-        .with_context(|| format!("downloading snapshot {}", newest.location))?
-        .bytes()
-        .await
-        .with_context(|| format!("reading snapshot body {}", newest.location))?;
-
-    std::fs::write(dest_path, &bytes)
-        .with_context(|| format!("writing restored snapshot to {dest_path}"))?;
-
-    Ok(newest.location.to_string())
+        .map(|o| o.location.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    // The library itself no longer opens a source database through the friendly
+    // wrapper (R858-B18 moved that to turso_core + OpenFlags::ReadOnly); these
+    // tests still use it to *write* their fixtures, which is the right surface
+    // for a writer.
+    use turso::Builder;
 
     /// A throwaway db path under the OS temp dir, cleaned up on drop.
     struct TempDb(std::path::PathBuf);

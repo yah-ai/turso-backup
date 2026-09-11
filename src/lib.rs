@@ -51,3 +51,7 @@ pub mod claim;
 /// R850-F1: hydrate-on-place — fill an empty volume's declared databases from
 /// the store before the workload starts, under a [`claim`].
 pub mod hydrate;
+/// R850-F1: the other half of [`hydrate`] — keep a *running* appliance's
+/// declared databases shipped to the store, beside an application that holds
+/// them open, under the same [`claim`].
+pub mod tail;

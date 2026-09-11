@@ -282,7 +282,28 @@ pub enum DedupOutcome {
 /// [`Unchanged`]: DedupOutcome::Unchanged
 pub async fn snapshot_dedup(db_path: &str, target: &BackupTarget) -> Result<DedupOutcome> {
     let image = raw_consistent_copy(db_path).await?;
-    let ps = page_size(&image)?;
+    snapshot_dedup_image(&image, target).await
+}
+
+/// Steps 2–4 of [`snapshot_dedup`] against an image the caller already holds.
+///
+/// R850-F1 split this out for the caller [`snapshot_dedup`] cannot serve: a tail
+/// running **beside a live application** that holds the database open. Step 1's
+/// [`raw_consistent_copy`] takes a `PRAGMA wal_checkpoint(TRUNCATE)` through an
+/// ordinary writable connection, and turso locks the whole file at open — so
+/// against a held database that step does not merely block the checkpoint, it
+/// fails to open at all (measured: `examples/appliance_tail_probe.rs`, A1).
+/// Such a caller produces its image with
+/// [`stream::raw_consistent_copy_live`](crate::stream::raw_consistent_copy_live)
+/// instead, which opens read-only and validates optimistically, and hands it
+/// here.
+///
+/// The page-layout precondition [`snapshot_dedup`] documents is unchanged and is
+/// now the caller's to keep: the image must be a raw page-preserving copy, not
+/// `VACUUM INTO` output, or every page hash moves on every run and the dedup
+/// stores a fresh full copy each time.
+pub async fn snapshot_dedup_image(image: &[u8], target: &BackupTarget) -> Result<DedupOutcome> {
+    let ps = page_size(image)?;
 
     let page_hashes: Vec<String> = image.chunks(ps).map(sha256_hex).collect();
     let total_pages = page_hashes.len();

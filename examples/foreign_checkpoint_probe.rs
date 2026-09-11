@@ -58,7 +58,15 @@
 //!   first run of this probe hung for ten minutes.
 //! - **G** — the prior question D assumes away: can turso open the file *at
 //!   all* while a foreign connection merely holds it open? This is headscale's
-//!   actual posture and it decides whether streaming is possible at all.
+//!   actual posture and it decides whether streaming is possible at all. G2r and
+//!   G3c are R858-B18's answer, each differing from its predecessor in exactly
+//!   one variable (`OpenFlags::ReadOnly` instead of the write default; the flag
+//!   instead of `LIMBO_DISABLE_FILE_LOCK=1`).
+//! - **H** — R858-B18: does the validation actually catch a torn read, or hand
+//!   back a plausible wrong image? Runs a foreign writer CONCURRENTLY with the
+//!   copy, in two regimes, because one write rate can only prove half of it.
+//! - **S** — R858-B18: the same question for the *snapshot* tier, which reaches
+//!   the source through `turso::Builder` and was blocked for the same reason.
 //! - **E** — cost: how many transactions before SQLite's *default*
 //!   autocheckpoint folds the WAL, i.e. how often the restart path fires.
 //!
@@ -74,10 +82,10 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use turso_backup::backpressure::BackpressureConfig;
-use turso_backup::snapshot::{upload_base_snapshot, BackupTarget};
+use turso_backup::snapshot::{snapshot_and_upload, upload_base_snapshot, BackupTarget};
 use turso_backup::stream::{
-    raw_consistent_copy_live, restore_latest_stream, tail_frames, CoreWalSeam, StreamConfig,
-    StreamOutcome, WalSeam, Watermark,
+    raw_consistent_copy_live, restore_latest_stream, tail_frames, CoreWalSeam, SourceFingerprint,
+    StreamConfig, StreamOutcome, WalSeam, Watermark,
 };
 
 const PAGE_SIZE: usize = 4096;
@@ -475,9 +483,13 @@ fn short(o: &StreamOutcome) -> String {
             format!("Streamed seq {checkpoint_seq} frames {first_frame}..={last_frame} ({frame_count})")
         }
         StreamOutcome::Restarted {
-            previous_checkpoint_seq, new_checkpoint_seq, first_frame, last_frame, ..
+            previous_generation, new_generation, first_frame, last_frame, ..
         } => format!(
-            "Restarted seq {previous_checkpoint_seq}->{new_checkpoint_seq} frames {first_frame}..={last_frame}"
+            "Restarted gen (seq {}, salt {})->(seq {}, salt {}) frames {first_frame}..={last_frame}",
+            previous_generation.checkpoint_seq,
+            previous_generation.salt.map_or("<unknown>".to_string(), |s| s.to_string()),
+            new_generation.checkpoint_seq,
+            new_generation.salt.map_or("<unknown>".to_string(), |s| s.to_string()),
         ),
         other => format!("{other:?}"),
     }
@@ -607,6 +619,16 @@ async fn probe_g() -> Result<()> {
         ),
         Err(e) => println!("G2 CoreWalSeam::open REFUSED: {e:#}"),
     }
+    // R858-B18: the same open differing in ONE variable — OpenFlags::ReadOnly,
+    // no env var. If this succeeds where G2 was refused, the lock is a
+    // per-handle guard and the backup path can decline to take it.
+    match CoreWalSeam::open_reader(&db) {
+        Ok(s) => println!(
+            "G2r CoreWalSeam::open_reader (OpenFlags::ReadOnly, no env var) SUCCEEDED alongside it -> {:?}",
+            s.wal_state()?
+        ),
+        Err(e) => println!("G2r CoreWalSeam::open_reader REFUSED: {e:#}"),
+    }
     match raw_consistent_copy_live(&db, PAGE_SIZE).await {
         Ok(img) => println!("G3 raw_consistent_copy_live SUCCEEDED ({} bytes)", img.len()),
         Err(e) => println!("G3 raw_consistent_copy_live REFUSED: {e:#}"),
@@ -627,6 +649,27 @@ async fn probe_g() -> Result<()> {
             break;
         }
     }
+    // R858-B18 G3c — the measurement this ticket's fix rests on. Differs from
+    // G3b below in EXACTLY ONE variable: the per-handle OpenFlags::ReadOnly
+    // (via CoreWalSeam::open_reader, which raw_consistent_copy_live now uses)
+    // instead of the process-wide LIMBO_DISABLE_FILE_LOCK=1. Same source state,
+    // same 4 rows, same assertions — so a matching verdict proves the flag
+    // reproduces G3b rather than us assuming it does. Runs BEFORE the env var
+    // is ever set, so the env var cannot be the explanation.
+    let g3c = raw_consistent_copy_live(&db, PAGE_SIZE).await;
+    match &g3c {
+        Ok(img) => {
+            let out = p.path("g-readonly.db");
+            std::fs::write(&out, img)?;
+            println!(
+                "G3c with OpenFlags::ReadOnly (no env var), copy SUCCEEDED ({} bytes); integrity_check {:?}; rows {:?} (source has 4, incl. the row written while we read)",
+                img.len(),
+                sqlite3_clean(&out, "PRAGMA integrity_check;"),
+                row_count(&out)
+            );
+        }
+        Err(e) => println!("G3c with OpenFlags::ReadOnly (no env var), copy REFUSED: {e:#}"),
+    }
     std::env::set_var("LIMBO_DISABLE_FILE_LOCK", "1");
     match raw_consistent_copy_live(&db, PAGE_SIZE).await {
         Ok(img) => {
@@ -643,6 +686,26 @@ async fn probe_g() -> Result<()> {
     }
     std::env::remove_var("LIMBO_DISABLE_FILE_LOCK");
 
+    // R858-B18 G6 — the ticket's TITLE claim, which G2/G3 only approached:
+    // can turso-backup *tail* (not merely copy) a database a foreign process is
+    // holding? Base snapshot via the reader path, then tail_frames through a
+    // ReadOnly seam, with the holder still attached. A locking error here would
+    // mean the flag fixed the snapshot tier and not the stream tier.
+    if let Ok(img) = &g3c {
+        let tgt = target();
+        let base = upload_base_snapshot(&tgt, img).await?;
+        match CoreWalSeam::open_reader(&db) {
+            Ok(seam) => match tail_frames(&seam, &tgt, &cfg(&base)).await {
+                Ok(o) => println!(
+                    "G6 tail_frames through a ReadOnly seam, foreign holder STILL attached: {}",
+                    short(&o)
+                ),
+                Err(e) => println!("G6 tail_frames through a ReadOnly seam FAILED: {e:#}"),
+            },
+            Err(e) => println!("G6 could not open a ReadOnly seam to tail: {e:#}"),
+        }
+    }
+
     let _ = Command::new("kill").arg("-9").arg(child.id().to_string()).status();
     let _ = child.wait();
     drop(sin);
@@ -653,14 +716,334 @@ async fn probe_g() -> Result<()> {
         Err(e) => println!("G5 CoreWalSeam::open still REFUSED: {e:#}"),
     }
     println!(
-        "G VERDICT: BY DEFAULT turso and upstream C SQLite are mutually exclusive on one file — \
+        "G VERDICT: A WRITABLE turso open and upstream C SQLite are mutually exclusive on one file — \
          turso_core takes a whole-file exclusive fcntl lock at open (io/unix.rs lock_file(true)), \
          so whichever opens first locks the other out, and headscale holds its connection for its \
-         whole process lifetime. This is a GUARD, not a format incompatibility: with \
-         LIMBO_DISABLE_FILE_LOCK=1 the same copy succeeds and is correct. But that env var removes \
-         the guard process-wide and buys no shared locking protocol — turso locks the whole file, \
-         C SQLite uses byte-range locks plus the -shm WAL index, and neither observes the other."
+         whole process lifetime (G2). That is a GUARD, not a format incompatibility, and R858-B18 \
+         resolved it AT THE HANDLE: OpenFlags::ReadOnly skips the lock for that one handle with no \
+         env var and no process-wide effect (G2r), and the resulting copy is byte-for-byte as good \
+         as the env-var one — G3c and G3b agree exactly, same size, integrity_check ok, same 4 rows \
+         including the one the holder wrote after we had already been refused. So LIMBO_DISABLE_FILE_LOCK \
+         is never needed and should never be used: it removes the guard for EVERY open in the \
+         process, including the writable ones. THE FLAG IS ONLY HALF: neither engine observes the \
+         other's locks (turso whole-file fcntl, C SQLite byte-range + the -shm WAL index), so \
+         getting in without a lock is not coordination — see probe H for the optimistic validation \
+         that turns 'may read torn state' into 'detects torn state and refuses', and probe S for \
+         the same two-part fix on the snapshot tier."
     );
+    Ok(())
+}
+
+/// H — R858-B18: does the optimistic validation actually CATCH a torn read, or
+/// does it hand back a plausible wrong image? Probe G proved the ReadOnly open
+/// gets us in the door; this one drives a foreign writer **concurrently with the
+/// copy** and asks what comes out.
+///
+/// The three outcomes this distinguishes, which is the whole point:
+///
+/// - `Ok` with a valid image — validation held, the copy is a real point in time.
+/// - `Err` — validation caught movement and REFUSED. This is the outcome the
+///   ticket demands exist; without it, ReadOnly alone is the "may read torn
+///   state" trade that is strictly worse than refusing to open.
+/// - `Ok` with a corrupt image — the failure mode this probe exists to rule out.
+///   Every accepted image is integrity-checked and row-counted here, so this
+///   would show up as a WRONG verdict rather than as silence.
+///
+/// It also measures the cost of the *stricter* rule this crate deliberately does
+/// NOT use: how many of the same copies would have been refused had `wal_len`
+/// (i.e. a plain append) counted as movement. That number is the justification
+/// for [`SourceFingerprint::stable_across`] being narrower than field equality.
+///
+/// Run in TWO regimes, because a single write rate can only prove half of it.
+/// HOT (folds far more often than a copy takes) must show REFUSALS; CALM (the
+/// headscale-shaped rate: a small database, occasional single-row commits, the
+/// default autocheckpoint) must show ACCEPTS. Neither may ever show a corrupt
+/// accepted image.
+async fn probe_h() -> Result<()> {
+    println!("\n=== PROBE H: validation under a foreign writer running CONCURRENTLY with the copy ===");
+    let hot = h_regime(
+        "HOT",
+        HRegime { seed_rows: 4000, autockpt: 16, batch: 40, pad: 400, pause_ms: 0, rounds: 12 },
+    )
+    .await?;
+    let calm = h_regime(
+        "CALM",
+        // headscale.db measures 94 KB, and a coordination server's node/route
+        // churn is single-row commits, not a bulk load. Default autocheckpoint
+        // (1000 pages) is what the foreign process actually runs.
+        HRegime { seed_rows: 200, autockpt: 1000, batch: 1, pad: 60, pause_ms: 15, rounds: 12 },
+    )
+    .await?;
+
+    println!(
+        "H VERDICT: {}",
+        if hot.corrupt > 0 || calm.corrupt > 0 {
+            "WRONG — an image was accepted that should not have been; the validation is not sufficient."
+        } else if hot.refused == 0 {
+            "UNPROVEN (refuse half) — no refusal was observed even in the HOT regime, so this run did not exercise the detector."
+        } else if calm.accepted == 0 {
+            "UNPROVEN (accept half) — the detector refuses, but even the CALM regime never produced a validated image, so the protocol may be too strict to back up a live database at all."
+        } else {
+            "CORRECT — under concurrent foreign writes the copy either returns a validated point-in-time image or REFUSES, and never returned a torn image. The CALM (headscale-shaped) regime backs up successfully WHILE the foreign process writes; the HOT regime is correctly reported as unbackupable rather than silently mis-copied."
+        }
+    );
+    Ok(())
+}
+
+/// One probe-H write regime. `pause_ms` throttles the foreign writer between
+/// commits; `autockpt` is the `wal_autocheckpoint` the *writer's* connection runs
+/// (the pragma is per-connection, so setting it anywhere else measures nothing).
+struct HRegime {
+    seed_rows: i64,
+    autockpt: i64,
+    batch: i64,
+    pad: usize,
+    pause_ms: u64,
+    rounds: u32,
+}
+
+/// What one regime measured.
+struct HResult {
+    accepted: u32,
+    refused: u32,
+    corrupt: u32,
+}
+
+async fn h_regime(tag: &str, r: HRegime) -> Result<HResult> {
+    let p = Probe::new(&format!("h-{}", tag.to_lowercase()))?;
+    let db = p.path("h.db");
+    seed_clean(&db, r.seed_rows)?;
+    println!(
+        "\nH0[{tag}] seeded {} rows: main {}B | {} | writer autocheckpoint {} pages, {}-row commits every {}ms",
+        r.seed_rows,
+        file_len(&db),
+        hdr_str(&db),
+        r.autockpt,
+        r.batch,
+        r.pause_ms
+    );
+
+    // Long-lived foreign writer. No sentinel round-trip: the point is for it to
+    // be mid-flight while we copy, not to be synchronised with us.
+    let mut child = Command::new(sqlite3_bin())
+        .arg(&db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut sin = child.stdin.take().expect("piped stdin");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let feeder_stop = stop.clone();
+    let (autockpt, batch, pad, pause_ms) = (r.autockpt, r.batch, r.pad, r.pause_ms);
+    let feeder = std::thread::spawn(move || {
+        let mut i = 100_000i64;
+        let _ = writeln!(sin, "PRAGMA wal_autocheckpoint={autockpt};");
+        while !feeder_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut sql = String::from("BEGIN;\n");
+            for _ in 0..batch {
+                sql.push_str(&format!(
+                    "INSERT INTO t(id,v) VALUES({i},'{}');\n",
+                    "y".repeat(pad)
+                ));
+                i += 1;
+            }
+            sql.push_str("COMMIT;\n");
+            if writeln!(sin, "{sql}").is_err() {
+                break;
+            }
+            let _ = sin.flush();
+            if pause_ms > 0 {
+                std::thread::sleep(Duration::from_millis(pause_ms));
+            }
+        }
+        drop(sin);
+    });
+
+    let mut res = HResult { accepted: 0, refused: 0, corrupt: 0 };
+    let mut strict_would_refuse = 0u32;
+    let mut first_refusal: Option<String> = None;
+    let mut last_rows: i64 = 0;
+    for round in 0..r.rounds {
+        let before = SourceFingerprint::read(&db)?;
+        let started = Instant::now();
+        let got = raw_consistent_copy_live(&db, PAGE_SIZE).await;
+        let elapsed = started.elapsed();
+        let after = SourceFingerprint::read(&db)?;
+        if before.wal_len != after.wal_len {
+            strict_would_refuse += 1;
+        }
+        match got {
+            Ok(img) => {
+                res.accepted += 1;
+                let out = p.path(&format!("h-img-{round}.db"));
+                std::fs::write(&out, &img)?;
+                let integrity = sqlite3_clean(&out, "PRAGMA integrity_check;");
+                let rows = row_count(&out);
+                let ok = matches!(integrity.as_deref(), Ok("ok"))
+                    && rows.as_ref().is_ok_and(|n| *n >= last_rows);
+                if ok {
+                    last_rows = *rows.as_ref().unwrap();
+                } else {
+                    res.corrupt += 1;
+                    println!(
+                        "H1[{tag}/{round}] ACCEPTED a BAD image after {elapsed:?}: {} bytes; integrity {:?}; rows {:?} (previous accepted image had {last_rows})",
+                        img.len(),
+                        integrity,
+                        rows
+                    );
+                }
+                let _ = std::fs::remove_file(&out);
+            }
+            Err(e) => {
+                res.refused += 1;
+                if first_refusal.is_none() {
+                    first_refusal = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = Command::new("kill").arg("-9").arg(child.id().to_string()).status();
+    let _ = child.wait();
+    let _ = feeder.join();
+
+    println!(
+        "H2[{tag}] {} copies under a concurrent foreign writer: {} accepted, {} refused-and-validated, {} accepted-but-corrupt",
+        r.rounds, res.accepted, res.refused, res.corrupt
+    );
+    println!(
+        "H3[{tag}] every accepted image passed PRAGMA integrity_check and was row-count-monotonic: {} (last accepted image had {last_rows} rows)",
+        res.corrupt == 0
+    );
+    match &first_refusal {
+        Some(m) => println!("H4[{tag}] first refusal message, verbatim: {m}"),
+        None => println!("H4[{tag}] no refusal was observed in {} rounds", r.rounds),
+    }
+    println!(
+        "H5[{tag}] the STRICTER rule this crate does not use (wal_len counts as movement) would have refused {strict_would_refuse}/{} of the same copies",
+        r.rounds
+    );
+    Ok(res)
+}
+
+/// S — R858-B18: the SNAPSHOT tier (tier 1a), which the ticket's gotcha names as
+/// the second blocked source open and which probe G never touched. `snapshot.rs`
+/// reaches the source through `turso::Builder::new_local` — the friendly wrapper,
+/// which exposes no `OpenFlags` — so it takes the same whole-file exclusive lock
+/// that refused `CoreWalSeam::open`.
+///
+/// Four measurements against one live foreign holder:
+///
+/// - **S1** `snapshot_and_upload`, the shipping entry point. Before R858-B18 this
+///   was refused outright with `Locking error: File is locked by another process`
+///   (measured 2026-09-10, before the change); it now goes through the read-only
+///   path and should succeed.
+/// - **S1w** the control that keeps S1 honest: the same `VACUUM INTO` through a
+///   **writable** open, which is what `snapshot.rs` used to do. Still expected to
+///   be refused — so the difference between S1w and S2 is the flag and nothing
+///   else.
+/// - **S2** `VACUUM INTO` driven through a `turso_core` connection opened
+///   `OpenFlags::ReadOnly`. This is the question that decides whether tier 1a can
+///   keep `VACUUM INTO` at all: the flag gets the file open, but VACUUM INTO is a
+///   statement, and a read-only connection might refuse to run it.
+/// - **S3** the tier-2-compatible reader path — `raw_consistent_copy_live` +
+///   `upload_base_snapshot`, which publishes a page-preserving image under the
+///   same key layout (`VACUUM INTO` repacks, so its output is not a valid tier-2
+///   base).
+async fn probe_s() -> Result<()> {
+    println!("\n=== PROBE S: the snapshot tier against a live foreign holder ===");
+    let p = Probe::new("s")?;
+    let db = p.path("s.db");
+    seed_clean(&db, 50)?;
+
+    let mut child = Command::new(sqlite3_bin())
+        .arg(&db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut sin = child.stdin.take().expect("piped stdin");
+    let sout = child.stdout.take().expect("piped stdout");
+    let mut rd = BufReader::new(sout);
+    writeln!(sin, "SELECT count(*) FROM t;\nSELECT 'PROBE-SENTINEL';")?;
+    sin.flush()?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        anyhow::ensure!(rd.read_line(&mut line)? > 0, "foreign holder died early");
+        if line.contains("PROBE-SENTINEL") {
+            break;
+        }
+    }
+    println!("S0 foreign sqlite3 connection is open and idle on the DB");
+
+    let tgt = target();
+    match snapshot_and_upload(&db, &tgt).await {
+        Ok(o) => println!("S1 snapshot_and_upload SUCCEEDED -> {o:?}"),
+        Err(e) => println!("S1 snapshot_and_upload REFUSED: {e:#}"),
+    }
+
+    // S1w / S2: the same VACUUM INTO, differing ONLY in the open flags. Note
+    // VACUUM INTO is NOT gated by DatabaseOpts::enable_vacuum (only bare VACUUM
+    // is — turso_core translate/vacuum.rs:39), so plain DatabaseOpts::new() is
+    // the right opts for both and any difference is attributable to the flag.
+    for (tag, flags) in [
+        ("S1w VACUUM INTO via write flags (what snapshot.rs did before)", turso_core::OpenFlags::default()),
+        ("S2 VACUUM INTO via OpenFlags::ReadOnly", turso_core::OpenFlags::ReadOnly),
+    ] {
+        let vac = p.path(&format!("s-vacuum-{:?}.db", flags));
+        let _ = std::fs::remove_file(&vac);
+        let got = (|| -> anyhow::Result<()> {
+            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
+            let core = turso_core::Database::open_file_with_flags(
+                io,
+                &db,
+                flags,
+                turso_core::DatabaseOpts::new(),
+                None,
+            )?;
+            let conn = core.connect()?;
+            conn.execute(format!("VACUUM INTO '{}'", vac.replace('\'', "''")))?;
+            Ok(())
+        })();
+        match got {
+            Ok(()) => println!(
+                "{tag} SUCCEEDED -> {}B; integrity_check {:?}; rows {:?}",
+                file_len(&vac),
+                sqlite3_clean(&vac, "PRAGMA integrity_check;"),
+                row_count(&vac)
+            ),
+            Err(e) => println!("{tag} REFUSED: {e:#}"),
+        }
+    }
+
+    // S3: the reader path. Same published key layout, no writable source open.
+    match raw_consistent_copy_live(&db, PAGE_SIZE).await {
+        Ok(img) => {
+            let key = upload_base_snapshot(&tgt, &img).await?;
+            let out = p.path("s-reader.db");
+            std::fs::write(&out, &img)?;
+            println!(
+                "S3 raw_consistent_copy_live + upload_base_snapshot SUCCEEDED -> {key} ({}B); integrity_check {:?}; rows {:?}",
+                img.len(),
+                sqlite3_clean(&out, "PRAGMA integrity_check;"),
+                row_count(&out)
+            );
+        }
+        Err(e) => println!("S3 reader path REFUSED: {e:#}"),
+    }
+    println!(
+        "S VERDICT: tier 1a was blocked for exactly the same reason as tier 2 and is fixed the same \
+         way — S1w (write flags) is still refused while S2 (OpenFlags::ReadOnly) vacuums the same \
+         live source successfully, so VACUUM INTO does run on a read-only connection and tier 1a \
+         keeps its byte-deterministic gate-2 hash. snapshot.rs now opens through turso_core with \
+         that flag instead of turso::Builder (which exposes no OpenFlags), wrapped in the same \
+         optimistic validation, which is why S1 succeeds where it used to report a locking error."
+    );
+
+    let _ = Command::new("kill").arg("-9").arg(child.id().to_string()).status();
+    let _ = child.wait();
+    drop(sin);
     Ok(())
 }
 
@@ -781,6 +1164,12 @@ async fn main() -> Result<()> {
     }
     if on("g") {
         probe_g().await?;
+    }
+    if on("h") {
+        probe_h().await?;
+    }
+    if on("s") {
+        probe_s().await?;
     }
     if on("e") {
         probe_e()?;

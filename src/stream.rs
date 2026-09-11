@@ -13,8 +13,14 @@
 //! frames/{epoch:020}/{checkpoint_seq:010}/{frame_no:020}          one raw frame, pre-R761-F2 layout
 //! frames/{checkpoint_seq:010}/{frame_no:020}                      ditto, epoch 0 (pre-fencing)
 //! generations/gen-{unix_nanos:020}.manifest                one per `tail_frames` call that uploaded
-//! latest.stream-watermark    text sidecar: "<checkpoint_seq> <last_frame> <written_at_nanos> <epoch> <pointer_generation>"
+//! latest.stream-watermark    text sidecar: "<checkpoint_seq> <last_frame> <written_at_nanos> <epoch> <pointer_generation> <salt1> <salt2>"
 //! ```
+//!
+//! R858-B19: the trailing salt pair is the WAL generation the `last_frame`
+//! position belongs to. `checkpoint_seq` alone does not identify a generation —
+//! a writer-process restart recreates the WAL back at sequence 0 — so the salt
+//! is what `tail_frames` compares and what a generation manifest stamps. See
+//! [`WalGeneration`].
 //!
 //! A frame object holds `n` consecutive frames, each `24 + page_size` bytes,
 //! concatenated in ascending frame order — so a batch is exactly the bytes the
@@ -203,12 +209,335 @@ pub const WAL_FRAME_HEADER_SIZE: usize = 24;
 
 /// Position in the WAL: a `(checkpoint_seq, last_frame)` pair. `max_frame`
 /// resets to 0 every time the WAL header restarts (`WalAutoActions::Restart`
-/// fires), but `checkpoint_seq_no` increments monotonically across restarts.
-/// So this pair is the right primary key for sink objects — not raw frame_no.
+/// fires), and `checkpoint_seq_no` increments alongside it — so the pair is
+/// the right primary key for sink objects, not raw frame_no.
+///
+/// **R858-B19 — `checkpoint_seq` alone does NOT identify a WAL generation, and
+/// this doc used to claim it did ("increments monotonically across restarts").
+/// That claim is false and it cost a silent wrong restore.** It holds only for
+/// an *in-process* restart, where the same WAL file is reused. When the last
+/// connection to a SQLite database closes, the engine checkpoints and DELETES
+/// the `-wal` file; the next writer creates a fresh WAL back at
+/// checkpoint-sequence `0` with a brand-new random salt. Across that fold
+/// `checkpoint_seq` goes `0 -> 0` over two completely unrelated WALs (measured
+/// 2026-09-06 against system sqlite3 3.51.0 by
+/// `examples/foreign_checkpoint_probe.rs`, probes B and F).
+///
+/// Generation identity therefore lives in [`WalGeneration`], which pairs the
+/// sequence with the WAL header's salt. Never compare two `Watermark`s'
+/// `checkpoint_seq` to decide "same WAL" — that is exactly the inference this
+/// ticket exists to delete. `last_frame` is only meaningful *relative to a
+/// known generation*.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Watermark {
     pub checkpoint_seq: u32,
     pub last_frame: u64,
+}
+
+/// R858-B19 — the WAL header's `(salt1, salt2)`, the two 32-bit values SQLite
+/// re-rolls on every WAL reset. Stored big-endian at bytes 16..24 of the
+/// 32-byte WAL header, and copied verbatim into bytes 8..16 of **every frame
+/// header** written under that header — which is where this crate reads it
+/// from, since `turso_core::WalState` exposes only `checkpoint_seq_no` and
+/// `max_frame`.
+///
+/// Why the salt and not the sequence: the salt moves in *both* fold regimes,
+/// and the sequence moves in only one.
+///
+/// - WAL recreated by a writer restart: fresh randomness (measured
+///   `b83c03f5 -> 9ca89e39`, unrelated), while `checkpoint_seq` resets `0 -> 0`.
+/// - In-process autocheckpoint: `salt1` increments in lockstep with the
+///   sequence (measured `d492ea8a -> ... -> d492ea92` alongside seq `0 -> 8`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalSalt {
+    pub salt1: u32,
+    pub salt2: u32,
+}
+
+impl WalSalt {
+    /// Read the salt out of a WAL **frame** header (bytes 8..16 of the 24-byte
+    /// header, big-endian). Panics on a short slice — every caller here sizes
+    /// its buffer at `WAL_FRAME_HEADER_SIZE + page_size`.
+    pub(crate) fn from_frame_header(frame: &[u8]) -> Self {
+        let be = |o: usize| u32::from_be_bytes(frame[o..o + 4].try_into().unwrap());
+        Self { salt1: be(8), salt2: be(12) }
+    }
+
+    /// R858-B18 — read the salt out of the **32-byte `-wal` file header**
+    /// (bytes 16..24, big-endian), the copy SQLite writes once per WAL
+    /// generation and duplicates into every frame header.
+    ///
+    /// The two constructors differ only in offset, and they live together
+    /// deliberately: one type, one place, so the two ways this crate can reach
+    /// the same value can never disagree. [`from_frame_header`](Self::from_frame_header)
+    /// is the seam-only path ([`read_wal_salt`] — works through a
+    /// [`CoreWalSeam::from_conn`] that has no path); this one is the
+    /// path-only path ([`SourceFingerprint`] — works with no engine open at
+    /// all, which is what makes it usable as an independent check *on* a copy
+    /// the engine took).
+    ///
+    /// Panics on a slice shorter than 24 bytes; [`WalFileHeader::parse`] is the
+    /// length-checked entry point every caller here actually uses.
+    pub(crate) fn from_wal_file_header(hdr: &[u8]) -> Self {
+        let be = |o: usize| u32::from_be_bytes(hdr[o..o + 4].try_into().unwrap());
+        Self { salt1: be(16), salt2: be(20) }
+    }
+}
+
+impl std::fmt::Display for WalSalt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:08x}/{:08x}", self.salt1, self.salt2)
+    }
+}
+
+/// R858-B19 — the identity of one WAL generation: the checkpoint sequence
+/// **and** the header salt that actually distinguishes it. This is what
+/// [`tail_frames`] compares across calls, what the watermark sidecar persists,
+/// and what a generation manifest stamps.
+///
+/// `salt: None` means **unknown generation**, and unknown is a value here, not
+/// a missing one: it arises from a sidecar or manifest written before this
+/// field existed, or from a WAL with no frames to read a salt out of. An
+/// unknown generation is never provably equal to anything — see
+/// [`WalGeneration::is_provably_same_as`] — so it forces a restart on the write
+/// side and a refusal on the restore side rather than a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WalGeneration {
+    pub checkpoint_seq: u32,
+    pub salt: Option<WalSalt>,
+}
+
+impl WalGeneration {
+    /// True only when both sides carry a **known** salt and every component
+    /// agrees — i.e. only when these are *provably* the same WAL.
+    ///
+    /// The asymmetry is the whole point. "Not provably the same" is treated as
+    /// "different", which costs a redundant re-upload (or a loud restore
+    /// refusal) in the worst case. The opposite default — "no evidence of a
+    /// change, so assume it is the same WAL" — is what spliced two WAL
+    /// generations into one chain and restored a plausible wrong image.
+    pub fn is_provably_same_as(&self, other: &WalGeneration) -> bool {
+        match (self.salt, other.salt) {
+            (Some(a), Some(b)) => a == b && self.checkpoint_seq == other.checkpoint_seq,
+            _ => false,
+        }
+    }
+
+    /// Render for an error message: `seq 4 salt 1109ca5e/7acf42a3`, or
+    /// `seq 4 salt <unknown>` when the salt was never recorded.
+    pub(crate) fn describe(&self) -> String {
+        match self.salt {
+            Some(s) => format!("seq {} salt {s}", self.checkpoint_seq),
+            None => format!("seq {} salt <unknown>", self.checkpoint_seq),
+        }
+    }
+}
+
+/// R858-B18 — the 32-byte `-wal` file header, read straight off disk with no
+/// engine open. Ground truth about which WAL generation is on disk and how far
+/// it has been written, independent of anything turso caches.
+///
+/// Only the three fields that move are kept. The rest of the header (magic,
+/// format version, the two header checksums) is either constant for a given
+/// build or a function of these; a change to any of it that did *not* move one
+/// of these three would not be a change this crate can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalFileHeader {
+    /// Page size the WAL's frames carry (bytes 8..12).
+    pub page_size: u32,
+    /// Checkpoint sequence (bytes 12..16) — the field `tail_frames` used to key
+    /// restart detection on before [`WalGeneration`] paired it with the salt.
+    pub checkpoint_seq: u32,
+    /// The generation's salt (bytes 16..24).
+    pub salt: WalSalt,
+}
+
+impl WalFileHeader {
+    /// SQLite's WAL header is exactly this many bytes, ahead of frame 1.
+    pub const SIZE: usize = 32;
+
+    /// Parse a WAL header out of the first [`Self::SIZE`] bytes of a `-wal`
+    /// file. `None` for anything shorter — a truncated or freshly-created WAL
+    /// has no generation to name yet, which is an honest unknown rather than an
+    /// error (see [`WalGeneration`]'s `salt: None`).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::SIZE {
+            return None;
+        }
+        let be = |o: usize| u32::from_be_bytes(bytes[o..o + 4].try_into().unwrap());
+        Some(Self {
+            page_size: be(8),
+            checkpoint_seq: be(12),
+            salt: WalSalt::from_wal_file_header(bytes),
+        })
+    }
+
+    /// Read `{db_path}-wal`'s header. `Ok(None)` when the sidecar is absent
+    /// (WAL folded and deleted, or journal_mode != WAL) or too short to parse.
+    pub fn read(db_path: &str) -> Result<Option<Self>> {
+        match std::fs::File::open(format!("{db_path}-wal")) {
+            Ok(mut f) => {
+                let mut buf = [0u8; Self::SIZE];
+                let mut filled = 0usize;
+                loop {
+                    match std::io::Read::read(&mut f, &mut buf[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("reading {db_path}-wal header"))
+                        }
+                    }
+                    if filled == Self::SIZE {
+                        break;
+                    }
+                }
+                Ok(Self::parse(&buf[..filled]))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("opening {db_path}-wal")),
+        }
+    }
+}
+
+/// R858-B18 — everything about a source database's **files** that must hold
+/// still for a copy of them to be a point-in-time image, sampled with no engine
+/// open and no lock taken.
+///
+/// This is the other half of reading a foreign-written database. A ReadOnly
+/// open ([`CoreWalSeam::open_reader`]) gets us in the door without stealing the
+/// whole-file lock, but it buys **no shared locking protocol** with upstream C
+/// SQLite: turso locks whole files with `fcntl`, C SQLite uses byte-range locks
+/// plus the `-shm` WAL index, and neither engine observes the other's. So a
+/// foreign checkpoint landing in the middle of our copy can fold WAL frames
+/// into the main file we have already half-read, and the result is a torn image
+/// that still passes `PRAGMA integrity_check`.
+///
+/// Rather than reimplement SQLite's reader protocol (registering a read-mark in
+/// the `-shm` WAL index — a research project and a permanent compatibility
+/// liability against an engine we do not control), [`raw_consistent_copy_live`]
+/// uses textbook **optimistic validation**: sample this before the copy, sample
+/// it again after, and accept the copy only if nothing moved. That converts
+/// "may silently read torn state" into "detects torn state and refuses", needs
+/// no cooperation from the foreign engine, and costs two stats and a 132-byte
+/// read per attempt.
+///
+/// ## Why these fields
+///
+/// - `wal` (salt + checkpoint_seq) moves on **every** WAL reset, in both fold
+///   regimes — fresh randomness on a writer restart, `salt1` incrementing on an
+///   in-process autocheckpoint (both measured; see [`WalSalt`]).
+/// - `main_len` moves when a checkpoint grows the main database.
+/// - `change_counter` (main header bytes 24..28) moves on every write to the
+///   main file — i.e. on every checkpoint — even one that leaves its length
+///   alone. It is meaningful here **only because the foreign writer is C
+///   SQLite**: turso does not maintain this field (it stays `1` in every
+///   journal mode, verified — see `snapshot.rs`'s two-gate rationale), which is
+///   exactly why the WAL salt carries the weight and this one is corroboration.
+/// - `wal_len` is recorded for the report but deliberately **not** part of the
+///   accept/reject test — see [`Self::stable_across`], which is the comparison
+///   to use. There is no `PartialEq` on this type on purpose: a bare `==` would
+///   silently include `wal_len` and refuse every copy taken while the
+///   application was merely writing.
+#[derive(Debug, Clone, Copy)]
+pub struct SourceFingerprint {
+    /// Length of the main database file.
+    pub main_len: u64,
+    /// The main header's change counter, or `None` when the file is too short
+    /// to carry a SQLite header at all (a database whose page 1 still lives
+    /// only in the WAL). Unknown-and-unknown compares equal, which is safe
+    /// because `main_len` participates in the same comparison.
+    pub change_counter: Option<u32>,
+    /// The `-wal` header, or `None` when there is no WAL sidecar.
+    pub wal: Option<WalFileHeader>,
+    /// Length of the `-wal` file (`0` when absent).
+    pub wal_len: u64,
+}
+
+impl SourceFingerprint {
+    /// Offset of the change counter in SQLite's 100-byte database header.
+    const CHANGE_COUNTER_OFFSET: usize = 24;
+
+    /// Sample the fingerprint of the database at `db_path`. Touches nothing:
+    /// two metadata calls plus a 28-byte and a 32-byte read.
+    pub fn read(db_path: &str) -> Result<Self> {
+        let mut hdr = [0u8; Self::CHANGE_COUNTER_OFFSET + 4];
+        let main_len = match std::fs::File::open(db_path) {
+            Ok(mut f) => {
+                let len = f
+                    .metadata()
+                    .with_context(|| format!("stat {db_path}"))?
+                    .len();
+                if len as usize >= hdr.len() {
+                    std::io::Read::read_exact(&mut f, &mut hdr)
+                        .with_context(|| format!("reading {db_path} header"))?;
+                }
+                len
+            }
+            Err(e) => return Err(e).with_context(|| format!("opening source db {db_path}")),
+        };
+        let change_counter = (main_len as usize >= hdr.len()).then(|| {
+            u32::from_be_bytes(hdr[Self::CHANGE_COUNTER_OFFSET..].try_into().unwrap())
+        });
+        Ok(Self {
+            main_len,
+            change_counter,
+            wal: WalFileHeader::read(db_path)?,
+            wal_len: std::fs::metadata(format!("{db_path}-wal"))
+                .map(|m| m.len())
+                .unwrap_or(0),
+        })
+    }
+
+    /// True when nothing that can **tear** a copy moved between `self` (sampled
+    /// before) and `after` (sampled after). This is the accept test in
+    /// [`raw_consistent_copy_live`], and it is narrower than field equality on
+    /// purpose.
+    ///
+    /// ## What can tear the copy, and what cannot
+    ///
+    /// The copy reads the main file, then replays WAL frames `1..=max_frame`
+    /// captured when the seam opened. Against that algorithm:
+    ///
+    /// - **A checkpoint tears it.** It rewrites pages of the main file *and*
+    ///   resets the WAL, so our already-read main bytes and our frame reads can
+    ///   straddle the fold — replaying pre-fold frames over post-fold pages
+    ///   rolls pages backwards. Caught: a checkpoint bumps `change_counter`
+    ///   and/or `main_len`, and a WAL restart re-rolls the salt and the sequence
+    ///   (measured in both regimes, `examples/foreign_checkpoint_probe.rs`
+    ///   probes A and E).
+    /// - **A plain append does NOT tear it.** SQLite only ever appends frames
+    ///   within a generation, and only a reset (which re-rolls `salt1`) lets it
+    ///   overwrite an existing frame. So frames `1..=max_frame` are immutable
+    ///   for as long as the salt holds, and a writer that commits during our
+    ///   copy just means our image is a slightly earlier point in time — which
+    ///   is what a point-in-time copy *is*.
+    ///
+    /// Which is why `wal_len` and the frame count are excluded. Including them
+    /// buys no additional safety and costs a refusal on every copy taken while
+    /// the application is writing at all — turning a working backup into one
+    /// that only succeeds against an idle database. R858-B18 measured that
+    /// difference rather than assuming it; see probe H.
+    pub fn stable_across(&self, after: &Self) -> bool {
+        self.main_len == after.main_len
+            && self.change_counter == after.change_counter
+            && self.wal == after.wal
+    }
+
+    /// One-line rendering for the refusal message, so a failure names what
+    /// actually moved instead of asserting "something did".
+    pub(crate) fn describe(&self) -> String {
+        let wal = match self.wal {
+            Some(h) => format!("seq {} salt {}", h.checkpoint_seq, h.salt),
+            None => "<no WAL>".to_string(),
+        };
+        format!(
+            "main {}B change_counter {} | wal {}B {wal}",
+            self.main_len,
+            self.change_counter.map_or("<unknown>".to_string(), |c| c.to_string()),
+            self.wal_len,
+        )
+    }
 }
 
 /// Subset of `turso_core::Connection`'s `feature = "conn_raw_api"` surface
@@ -277,9 +606,16 @@ pub struct CoreWalSeam {
 }
 
 impl CoreWalSeam {
-    /// Open a connection at `path` and disable auto-checkpoint / auto-restart
-    /// so the caller owns WAL maintenance. Requires `turso_core` with
-    /// `features = ["conn_raw_api"]` (set in this crate's Cargo.toml).
+    /// Open a **writable** connection at `path` and disable auto-checkpoint /
+    /// auto-restart so the caller owns WAL maintenance. Requires `turso_core`
+    /// with `features = ["conn_raw_api"]` (set in this crate's Cargo.toml).
+    ///
+    /// This takes turso's **whole-file exclusive `fcntl` lock**, so it is
+    /// mutually exclusive with any other process holding the database open —
+    /// including upstream C SQLite (measured: `examples/foreign_checkpoint_probe.rs`
+    /// probes D and G). That is correct for the restore/apply direction, which
+    /// owns the destination file outright, and wrong for reading a live source:
+    /// use [`Self::open_reader`] there.
     pub fn open(path: &str) -> Result<Self> {
         let io: Arc<dyn turso_core::IO> =
             Arc::new(turso_core::PlatformIO::new().context("creating turso_core PlatformIO")?);
@@ -287,6 +623,54 @@ impl CoreWalSeam {
             .with_context(|| format!("opening turso_core db {path}"))?;
         let conn = db.connect().context("connecting to turso_core db")?;
         // Take WAL ownership — same first move sync_server.rs makes.
+        conn.wal_auto_actions_disable();
+        Ok(Self { conn })
+    }
+
+    /// R858-B18 — open a **read-only** connection at `path`, taking **no**
+    /// whole-file lock. This is the constructor the backup direction wants: a
+    /// backup is a reader, and it must not lock out the application whose
+    /// database it is reading.
+    ///
+    /// `OpenFlags::ReadOnly` is what buys that, per handle and with no
+    /// process-wide effect. `turso_core-0.7.2/io/unix.rs:67-72` takes the
+    /// exclusive lock only when
+    /// `env::var(ENV_DISABLE_FILE_LOCK).is_err() && !flags.intersects(ReadOnly | NoLock)`;
+    /// `io_uring.rs:463` and `windows.rs:305` carry the identical condition, so
+    /// this is not a unix-only accident. The `LIMBO_DISABLE_FILE_LOCK=1` escape
+    /// hatch reaches the same no-lock state but does it for **every** open in
+    /// the process, including the writable ones — never use it here.
+    ///
+    /// ## Two things this does NOT give you
+    ///
+    /// 1. **No shared locking protocol.** Getting in without a lock is not
+    ///    coordination: a foreign checkpoint can still land mid-read. That is
+    ///    what [`SourceFingerprint`] validation is for, and why
+    ///    [`raw_consistent_copy_live`] pairs the two rather than shipping this
+    ///    flag alone — the flag alone converts "refuses to open" into "may
+    ///    return a torn image", which is strictly worse.
+    /// 2. **No escape from turso's process-global registry.**
+    ///    `Database::open_file_with_flags` consults `DATABASE_MANAGER`, keyed by
+    ///    file id, *before* it looks at the flags (`lib.rs:940`), and hands back
+    ///    an already-open `Database` with its own flags discarded. So in a
+    ///    process that already holds a writable handle on this exact file, this
+    ///    call returns that writable handle — same as `snapshot.rs`'s
+    ///    `upload_base_snapshot` doc records. Cross-process (the headscale case)
+    ///    is unaffected: the registry is per-process.
+    pub fn open_reader(path: &str) -> Result<Self> {
+        let io: Arc<dyn turso_core::IO> =
+            Arc::new(turso_core::PlatformIO::new().context("creating turso_core PlatformIO")?);
+        let db = turso_core::Database::open_file_with_flags(
+            io,
+            path,
+            turso_core::OpenFlags::ReadOnly,
+            turso_core::DatabaseOpts::new(),
+            None,
+        )
+        .with_context(|| format!("opening turso_core db {path} read-only"))?;
+        let conn = db.connect().context("connecting to turso_core db")?;
+        // Belt and braces: a read-only connection cannot checkpoint anyway, but
+        // the seam contract is that nothing we hold folds the WAL under us.
         conn.wal_auto_actions_disable();
         Ok(Self { conn })
     }
@@ -566,14 +950,21 @@ pub enum StreamOutcome {
         /// R574-T4: see [`StreamOutcome::Empty::rpo`].
         rpo: RpoStatus,
     },
-    /// The WAL header restarted since the last tail (`checkpoint_seq`
-    /// advanced). Frames `1..N` in the new sequence are uploaded; the sink
-    /// records both the old and new sequences. Restore replays in
-    /// (`checkpoint_seq`, `frame_no`) order.
+    /// The live WAL is not provably the one the sidecar watermark was taken
+    /// from, so this call re-uploaded frames `1..N` from the top rather than
+    /// resuming.
+    ///
+    /// R858-B19 widened this from "`checkpoint_seq` advanced" to "the
+    /// [`WalGeneration`] did not prove itself unchanged", which is why both
+    /// fields are now generations rather than bare sequence numbers: the
+    /// motivating case is a writer restart where the sequence reads `0 -> 0`
+    /// and only the salt moved. `previous_generation.salt == None` names the
+    /// third case — a sidecar written before the salt existed, restarted
+    /// because it cannot be checked, not because it was seen to change.
     Restarted {
         generation_key: String,
-        previous_checkpoint_seq: u32,
-        new_checkpoint_seq: u32,
+        previous_generation: WalGeneration,
+        new_generation: WalGeneration,
         first_frame: u64,
         last_frame: u64,
         frame_count: u64,
@@ -777,16 +1168,53 @@ impl BackupTarget {
     }
 }
 
+/// R858-B19 — identify the WAL generation `seam` is currently reading, by
+/// pulling the salt out of **frame 1's** header.
+///
+/// Frame 1 rather than the 32-byte WAL header because this goes through the
+/// [`WalSeam`] trait, which is the crate's one boundary against `turso_core`:
+/// `turso_core::WalState` reports only `checkpoint_seq_no` and `max_frame`, and
+/// reading the `-wal` file directly would need a path that
+/// [`CoreWalSeam::from_conn`] does not have. Every frame header carries a
+/// verbatim copy of the WAL header's salt, so frame 1 answers the same question
+/// through machinery every seam already implements — including the mocks, and
+/// including roadcase's connection-backed seam.
+///
+/// `Ok(None)` means the WAL holds no frames, so there is no generation to name
+/// yet. That is not a failure: it is the honest "unknown", and
+/// [`WalGeneration::is_provably_same_as`] treats it as such.
+///
+/// Costs one page-sized read per [`tail_frames`] call — negligible next to the
+/// frames that call is about to upload, and it is the only thing standing
+/// between a WAL recreate and a silently spliced generation chain.
+pub(crate) fn read_wal_salt<S: WalSeam>(
+    seam: &S,
+    page_size: usize,
+    last_frame: u64,
+) -> Result<Option<WalSalt>> {
+    if last_frame == 0 {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; WAL_FRAME_HEADER_SIZE + page_size];
+    seam.wal_get_frame(1, &mut buf)
+        .context("reading WAL frame 1 to identify the WAL generation (R858-B19)")?;
+    Ok(Some(WalSalt::from_frame_header(&buf)))
+}
+
 /// Tail new WAL frames from `seam` into `target`, anchored to a base
 /// snapshot. Idempotent and resumable: on the second call only frames after
 /// the recorded watermark are uploaded.
 ///
 /// Ordering within a single call:
 /// 1. Read [`Watermark`] from the seam (snapshot the current `(checkpoint_seq,
-///    max_frame)`).
+///    max_frame)`) and the current [`WalGeneration`] (that sequence plus the
+///    WAL salt, via [`read_wal_salt`]).
 /// 2. Read the prior watermark sidecar (if any).
-/// 3. If the seam's `checkpoint_seq` advanced, treat this as a restart:
-///    upload frames `1..=max_frame` under the new sequence.
+/// 3. Unless the sidecar's generation is *provably* the same WAL as the live
+///    one, treat this as a restart: upload frames `1..=max_frame`. R858-B19 —
+///    the test is [`WalGeneration::is_provably_same_as`], not a `checkpoint_seq`
+///    comparison, because a writer-process restart recreates the WAL at
+///    sequence `0` and an unchanged sequence therefore proves nothing.
 /// 4. Otherwise upload frames `prior.last_frame+1..=max_frame`.
 /// 5. Advance the watermark sidecar with a compare-and-swap on the version
 ///    read in step 2, then write a generation manifest pointing at the base
@@ -806,6 +1234,14 @@ pub async fn tail_frames<S: WalSeam>(
     cfg: &StreamConfig<'_>,
 ) -> Result<StreamOutcome> {
     let current = seam.wal_state()?;
+    // R858-B19: the salt is what actually names the WAL generation. Read it
+    // before anything else touches the sink, so the restart decision below is
+    // made against the live WAL rather than inferred from a sequence number
+    // that a writer restart silently resets.
+    let current_generation = WalGeneration {
+        checkpoint_seq: current.checkpoint_seq,
+        salt: read_wal_salt(seam, cfg.page_size, current.last_frame)?,
+    };
     let persisted = read_watermark(&target.store, &target.watermark_key()).await?;
     // R574-T4: staleness measured at call start, against the *prior*
     // sidecar write — i.e. how long the sink had gone without durable
@@ -838,9 +1274,21 @@ pub async fn tail_frames<S: WalSeam>(
     // this call needs the object version this read observed (R732-T3).
     let prior = persisted.as_ref().map(|p| p.watermark);
 
-    // Decide the range to upload.
-    let (start_frame, restarted) = match prior {
-        Some(p) if p.checkpoint_seq == current.checkpoint_seq => (p.last_frame + 1, false),
+    // R858-B19: the generation the sidecar was written under. `None` for a
+    // sidecar that predates the salt field — which reads as *unknown*, not as
+    // "the same WAL", and so forces the restart branch exactly once. After that
+    // one full re-upload the sink carries a salt and the stream self-heals.
+    let prior_generation = persisted.as_ref().map(|p| p.generation);
+
+    // Decide the range to upload. Resuming at `last_frame + 1` is only sound
+    // when the live WAL is PROVABLY the one the watermark was taken from: a
+    // writer-process restart deletes the `-wal` file and the next writer starts
+    // a fresh WAL at checkpoint-sequence 0 with a new salt, so an unchanged
+    // sequence is not evidence of anything. Anything short of proof restarts.
+    let (start_frame, restarted) = match prior_generation {
+        Some(g) if g.is_provably_same_as(&current_generation) => {
+            (prior.map(|p| p.last_frame).unwrap_or(0) + 1, false)
+        }
         Some(_) => (1, true),
         None => (1, false),
     };
@@ -877,6 +1325,28 @@ pub async fn tail_frames<S: WalSeam>(
         });
     };
 
+    // R858-B19: everything above sampled the generation ONCE, before the
+    // drain. A WAL recreate between calls is what this ticket is about, but
+    // nothing stops one landing *during* a call — and then the frames just
+    // uploaded are a mix of two WALs, which is the same corruption arriving by
+    // a narrower door. Re-read the salt and refuse if it moved.
+    //
+    // Refusing here is cheap and complete: the watermark has not advanced and
+    // no manifest has been written, so the frames that landed are orphaned
+    // under keys nothing references — invisible to restore, exactly like the
+    // `Shed` path — and the next tail re-derives everything from the sidecar.
+    let after = seam.wal_state()?;
+    let after_salt = read_wal_salt(seam, cfg.page_size, after.last_frame)?;
+    if after_salt != current_generation.salt {
+        anyhow::bail!(
+            "the source WAL was recreated while this tail was uploading ({} -> {}) — the frames \
+             this call read span two WAL generations, so nothing is published and the sink is left \
+             exactly as it was; the next tail will restart cleanly against the new WAL",
+            current_generation.describe(),
+            WalGeneration { checkpoint_seq: after.checkpoint_seq, salt: after_salt }.describe(),
+        );
+    }
+
     // Claim the range with a conditional watermark advance, THEN publish the
     // generation manifest. Under a Shed policy that persisted a partial
     // prefix, both cover only `start_frame..=uploaded_through`, not the full
@@ -893,6 +1363,7 @@ pub async fn tail_frames<S: WalSeam>(
         &target.store,
         &target.watermark_key(),
         Watermark { checkpoint_seq: current.checkpoint_seq, last_frame: uploaded_through },
+        current_generation.salt,
         cfg.epoch,
         cfg.pointer_generation,
         persisted.as_ref().and_then(|p| p.version.as_ref()),
@@ -933,6 +1404,11 @@ pub async fn tail_frames<S: WalSeam>(
         base_snapshot_key: cfg.base_snapshot_key,
         page_size: cfg.page_size,
         checkpoint_seq: current.checkpoint_seq,
+        // R858-B19: stamp the generation this range actually came from, so
+        // restore can refuse a chain that spans two WALs instead of splicing
+        // them. Always `Some` on this path — a `None` salt means an empty WAL,
+        // and an empty WAL took the `Empty` return above.
+        salt: current_generation.salt,
         first_frame: start_frame,
         last_frame: uploaded_through,
         epoch: cfg.epoch,
@@ -953,8 +1429,8 @@ pub async fn tail_frames<S: WalSeam>(
     if restarted {
         Ok(StreamOutcome::Restarted {
             generation_key: gen_key,
-            previous_checkpoint_seq: prior.map(|p| p.checkpoint_seq).unwrap_or(0),
-            new_checkpoint_seq: current.checkpoint_seq,
+            previous_generation: prior_generation.unwrap_or_default(),
+            new_generation: current_generation,
             first_frame: start_frame,
             last_frame: uploaded_through,
             frame_count,
@@ -1076,19 +1552,35 @@ async fn drain_frames_with_backpressure<S: WalSeam>(
     Ok(DrainOutcome { uploaded_through, frame_batches, report })
 }
 
+/// R858-B18 — how many times [`raw_consistent_copy_live`] will re-take a copy
+/// whose [`SourceFingerprint`] moved underneath it before giving up loudly.
+///
+/// Bounded on purpose. An unbounded retry against a database under sustained
+/// write pressure is an infinite loop that looks like a hang; a caller that
+/// wants to keep trying should be the one deciding how long to keep trying, on
+/// its own schedule. Four attempts is enough to ride out an isolated
+/// checkpoint (headscale's database measures 94 KB, so an attempt is
+/// sub-millisecond) and few enough that a genuinely hot database is reported as
+/// hot within a few milliseconds instead of being ground at.
+pub const COPY_VALIDATION_ATTEMPTS: u32 = 4;
+
 /// Take a raw, point-in-time-consistent byte image of the database at `db_path`
-/// WITHOUT folding the WAL via a `TRUNCATE` checkpoint. The live-writer pair of
+/// WITHOUT folding the WAL via a `TRUNCATE` checkpoint, and WITHOUT locking out
+/// the process that owns it. The live-writer pair of
 /// [`crate::dedup::raw_consistent_copy`], which a concurrent writer can make
 /// return `busy`.
 ///
 /// Algorithm — the read-only "copy main + replay WAL frames ourselves" path
-/// flagged in the working doc and the R005-T1 spike:
+/// flagged in the working doc and the R005-T1 spike, wrapped in R858-B18's
+/// optimistic validation:
 ///
-/// 1. Open a fresh `turso_core::Connection` via [`CoreWalSeam::open`], which
+/// 1. Sample the source's [`SourceFingerprint`] — WAL salt + checkpoint
+///    sequence, WAL length, main length, main change counter — straight off
+///    disk, with no engine open.
+/// 2. Open a fresh `turso_core::Connection` via [`CoreWalSeam::open_reader`],
+///    which takes **no** whole-file lock (so the application keeps working) and
 ///    calls `wal_auto_actions_disable` so our seam can't auto-checkpoint or
 ///    restart the WAL header mid-read on our connection.
-/// 2. Snapshot the watermark `(checkpoint_seq, max_frame)` via
-///    [`WalSeam::wal_state`].
 /// 3. Read the main DB file bytes from disk. With auto-actions disabled on our
 ///    connection the file cannot be folded by us; a concurrent writer in a
 ///    separate connection only ever extends the WAL (the main file is only
@@ -1099,22 +1591,122 @@ async fn drain_frames_with_backpressure<S: WalSeam>(
 ///    last commit are uncommitted mid-transaction garbage — drop them
 ///    (crash-consistency, matching restore's `wal_insert_end(false)`).
 /// 5. Truncate / grow the image to `db_size * page_size`.
+/// 6. Re-sample the fingerprint. **Accept the image only if
+///    [`SourceFingerprint::stable_across`] holds** — i.e. only if nothing that
+///    can tear the copy moved. A foreign checkpoint inside our read window would
+///    splice pre- and post-fold state; discard that image and retry from step 1,
+///    up to [`COPY_VALIDATION_ATTEMPTS`] times, then fail. (A plain WAL append
+///    is *not* movement for this purpose, and that distinction is what keeps
+///    this usable against a database that is actually in use — see
+///    `stable_across`.)
+///
+/// Step 6 is the entire correctness story against a foreign engine, and it is
+/// why this function never returns an unvalidated image: a torn WAL replay
+/// still produces a structurally valid SQLite file that passes
+/// `PRAGMA integrity_check`, so "it parsed" proves nothing. See
+/// [`SourceFingerprint`] for why validation rather than SQLite's real
+/// `-shm` reader protocol.
 ///
 /// Returned bytes are a self-contained vanilla-SQLite image (page-offset
 /// stable, no `-wal` sidecar required), ready to feed
 /// [`crate::dedup::snapshot_dedup`]'s content-addressed chunking under a
 /// concurrent writer.
 pub async fn raw_consistent_copy_live(db_path: &str, page_size: usize) -> Result<Vec<u8>> {
-    let seam = CoreWalSeam::open(db_path)
-        .with_context(|| format!("opening WAL seam on {db_path}"))?;
-    let main_bytes = std::fs::read(db_path)
-        .with_context(|| format!("reading main db file {db_path}"))?;
-    let image = replay_wal_onto_main(&seam, main_bytes, page_size)?;
+    let image = validated_against_source(db_path, "live copy", || async {
+        let seam = CoreWalSeam::open_reader(db_path)
+            .with_context(|| format!("opening read-only WAL seam on {db_path}"))?;
+        let main_bytes = std::fs::read(db_path)
+            .with_context(|| format!("reading main db file {db_path}"))?;
+        replay_wal_onto_main(&seam, main_bytes, page_size)
+        // Seam dropped at the end of this block, so nothing of ours holds the
+        // file while the post-copy fingerprint is sampled.
+    })
+    .await?;
     anyhow::ensure!(
         image.starts_with(b"SQLite format 3\0"),
         "live consistent copy of {db_path} is not a SQLite database"
     );
     Ok(image)
+}
+
+/// R858-B18 — run `take` against the live database at `db_path` and return its
+/// result **only** if the source provably held still for the duration.
+///
+/// This is the optimistic-validation protocol both source-side tiers share:
+/// tier 2's WAL-replay copy ([`raw_consistent_copy_live`]) and tier 1a's
+/// `VACUUM INTO` (`crate::snapshot`). Both read a database a foreign engine may
+/// be checkpointing underneath them, neither can take a lock that engine
+/// respects, and both are therefore only correct if a fold inside their read
+/// window is *detected*. `what` names the operation in the refusal message.
+///
+/// Each attempt samples a [`SourceFingerprint`] before and after, then
+/// classifies the outcome on both axes — did it succeed, and did the source
+/// move:
+///
+/// | | source held still | source moved |
+/// |---|---|---|
+/// | **`Ok`** | accept | discard, retry (it may splice pre-/post-fold state) |
+/// | **`Err`** | return the error — nothing raced us, so it is real | retry (a symptom of the race) |
+///
+/// That bottom-right cell is why the fingerprint is load-bearing beyond
+/// accept/reject: R858-B18's probe H measured the *common* shape of a caught
+/// race not as a clean torn image but as `short read on WAL frame` — a foreign
+/// checkpoint truncating the WAL while turso walked it. Without the fingerprint
+/// there is no way to tell that transient apart from a genuinely corrupt
+/// database, and the two want opposite handling.
+///
+/// After [`COPY_VALIDATION_ATTEMPTS`] attempts all of which saw movement, this
+/// fails loudly and returns nothing.
+pub(crate) async fn validated_against_source<T, F, Fut>(
+    db_path: &str,
+    what: &str,
+    mut take: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut moved: Option<(SourceFingerprint, SourceFingerprint, Option<anyhow::Error>)> = None;
+    for attempt in 1..=COPY_VALIDATION_ATTEMPTS {
+        if attempt > 1 {
+            // Back off between attempts: retrying instantly against a writer
+            // mid-checkpoint just spends the whole budget inside one fold.
+            tokio::time::sleep(std::time::Duration::from_millis(20 * u64::from(attempt - 1)))
+                .await;
+        }
+        let before = SourceFingerprint::read(db_path)?;
+        let attempted = take().await;
+        let after = SourceFingerprint::read(db_path)?;
+        let stable = before.stable_across(&after);
+        match attempted {
+            Ok(value) if stable => return Ok(value),
+            Ok(_) => moved = Some((before, after, None)),
+            Err(e) if !stable => moved = Some((before, after, Some(e))),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "{what} of {db_path} failed against a source that did NOT move during \
+                         the attempt ({}), so this is not a concurrent-writer race",
+                        before.describe()
+                    )
+                })
+            }
+        }
+    }
+    let (before, after, last_err) = moved.expect("COPY_VALIDATION_ATTEMPTS is non-zero");
+    let because = match last_err {
+        Some(e) => format!("the last attempt also failed mid-read ({e:#})"),
+        None => "each attempt produced a result that could not be validated".to_string(),
+    };
+    anyhow::bail!(
+        "refusing a {what} of {db_path}: the source moved under every one of \
+         {COPY_VALIDATION_ATTEMPTS} attempts, so nothing could be validated as \
+         point-in-time — {because}. The last attempt saw [{}] before and [{}] after, so a \
+         foreign writer or checkpointer is active. Retry on your own schedule; NO result \
+         is returned, because a torn read of a SQLite database still parses as valid SQLite.",
+        before.describe(),
+        after.describe(),
+    )
 }
 
 /// Pure replay of every committed WAL frame visible through `seam` onto
@@ -1222,7 +1814,10 @@ pub struct RestoreOutcome {
 pub(crate) struct ValidatedChain {
     pub base_snapshot_key: String,
     pub page_size: usize,
-    pub checkpoint_seq: u32,
+    /// R858-B19: the one WAL generation every manifest in the chain agrees on.
+    /// `salt` is `Some` for any chain of two or more manifests — a chain that
+    /// could not prove a single generation never gets this far.
+    pub generation: WalGeneration,
     pub total_frames: u64,
     /// R732-F2: the highest fencing epoch in the chain — i.e. the most recent
     /// owner that contributed frames. Unlike the other fields this is a
@@ -1241,6 +1836,27 @@ pub(crate) struct ValidatedChain {
 /// generations — replaying the post-restart frames onto our pre-restart base
 /// would skip that fold and corrupt the result. The remediation is a fresh
 /// tier-1a snapshot, not heroics in restore.
+///
+/// # R858-B19 — refuse what cannot be proven
+///
+/// The `checkpoint_seq` test above was the *only* generation check here, and it
+/// is blind to the fold that matters: a writer-process restart deletes the
+/// `-wal` file and the next writer starts a fresh WAL back at sequence `0`, so
+/// two unrelated WALs both report `0` and a spliced chain sailed through. That
+/// produced a restore that reported SUCCESS while writing a stale-but-plausible
+/// image (probe B: 9 rows against a 12-row source, `integrity_check ok`) or one
+/// upstream sqlite3 calls malformed (probe F). **A silent wrong image is the
+/// specific failure this function now exists to make impossible.**
+///
+/// So the salt is checked too, and — the part that matters — a chain that
+/// cannot be *shown* to come from one WAL is refused rather than replayed:
+///
+/// - Two or more manifests, any of them lacking a salt (written before `v4`):
+///   REFUSE. The splice is exactly what a pre-R858-B19 writer produced, and
+///   nothing in those manifests records which WAL each range came from.
+/// - Two or more manifests with disagreeing salts: REFUSE, naming both.
+/// - A single manifest: accepted with whatever salt it has, including none.
+///   One generation is not a splice; there is nothing to prove.
 pub(crate) fn validate_generation_chain(
     manifests: &[OwnedGenerationManifest],
 ) -> Result<ValidatedChain> {
@@ -1249,6 +1865,7 @@ pub(crate) fn validate_generation_chain(
         .context("validate_generation_chain: empty manifest list")?;
     let mut expected_next_frame: u64 = 1;
     let mut chain_epoch: u64 = 0;
+    let multi = manifests.len() > 1;
     for (i, m) in manifests.iter().enumerate() {
         // R732-F2 (W245): generations are ordered by write time, so a chain
         // whose epoch goes BACKWARDS says a stale owner wrote after the sink
@@ -1285,6 +1902,26 @@ pub(crate) fn validate_generation_chain(
                 first.checkpoint_seq,
             );
         }
+        // R858-B19: the check `checkpoint_seq` cannot make. Only enforced on a
+        // multi-manifest chain — a lone generation has nothing to be spliced
+        // to, so refusing it would strand every pre-v4 single-generation backup
+        // for no safety gain.
+        if multi {
+            let Some(s) = m.salt else {
+                anyhow::bail!(
+                    "generation #{i} carries no WAL salt (written by a pre-R858-B19 writer) and this chain spans {} generations — which WAL each range came from was never recorded, so a chain spliced across a WAL recreate is indistinguishable from a good one. Restore refuses rather than replay a plausible wrong image; take a fresh tier-1a snapshot",
+                    manifests.len(),
+                );
+            };
+            if let Some(fs) = first.salt {
+                if s != fs {
+                    anyhow::bail!(
+                        "generation #{i} was written under WAL salt {s} but the chain starts at salt {fs} (both at checkpoint_seq {}) — the source WAL was RECREATED mid-stream, so these frames belong to two different WALs and replaying them as one would corrupt the image. Restore needs a fresh tier-1a snapshot",
+                        first.checkpoint_seq,
+                    );
+                }
+            }
+        }
         if m.first_frame != expected_next_frame {
             anyhow::bail!(
                 "generation #{i} starts at frame {} but the previous generation ended at frame {} — gap in stream",
@@ -1304,7 +1941,10 @@ pub(crate) fn validate_generation_chain(
     Ok(ValidatedChain {
         base_snapshot_key: first.base_snapshot_key.clone(),
         page_size: first.page_size,
-        checkpoint_seq: first.checkpoint_seq,
+        generation: WalGeneration {
+            checkpoint_seq: first.checkpoint_seq,
+            salt: first.salt,
+        },
         total_frames: expected_next_frame - 1,
         epoch: chain_epoch,
     })
@@ -1488,7 +2128,7 @@ pub async fn restore_stream_from_manifests(
 
     Ok(RestoreOutcome {
         base_snapshot_key: chain.base_snapshot_key,
-        checkpoint_seq: chain.checkpoint_seq,
+        checkpoint_seq: chain.generation.checkpoint_seq,
         generation_count: manifests.len(),
         frames_replayed: frames,
         last_frame: chain.total_frames,
@@ -1593,10 +2233,11 @@ pub async fn read_fence_state(target: &BackupTarget) -> Result<Option<FenceState
 /// In-memory shape of a generation manifest. Format on disk:
 ///
 /// ```text
-/// TURSO-BACKUP STREAM v3
+/// TURSO-BACKUP STREAM v4
 /// base_snapshot <key>
 /// page_size <n>
 /// checkpoint_seq <n>
+/// wal_salt <salt1>-<salt2>
 /// first_frame <n>
 /// last_frame <n>
 /// epoch <n>
@@ -1608,16 +2249,29 @@ pub async fn read_fence_state(target: &BackupTarget) -> Result<Option<FenceState
 /// `dedup::Manifest` convention so the crate stays consistent.
 ///
 /// R732-F2 added `epoch`/`owner` and moved the header to `v2`. R761-F2 added
-/// the `frame_batch` list and moved it to `v3`. Older manifests still parse —
-/// `v1` with `epoch = 0`, `owner = None`; `v1`/`v2` with no batch list, which
-/// is what marks their frames as living one-per-object — so backups written
-/// before either change stay restorable. Neither older version is ever
-/// written any more.
+/// the `frame_batch` list and moved it to `v3`. R858-B19 added `wal_salt` and
+/// moved it to `v4`. Older manifests still parse — `v1` with `epoch = 0`,
+/// `owner = None`; `v1`/`v2` with no batch list, which is what marks their
+/// frames as living one-per-object; `v1`/`v2`/`v3` with `salt = None` — so
+/// backups written before any of those changes stay *parseable*. No older
+/// version is ever written any more.
+///
+/// R858-B19, and this is the one place a legacy manifest is not merely
+/// second-class: a chain of two or more manifests where any of them lacks a
+/// salt is **refused** by [`validate_generation_chain`], because a pre-R858-B19
+/// writer could splice two WAL generations into a contiguous-looking chain and
+/// nothing in the manifest records which WAL each range came from. A
+/// single-manifest chain is still restored — one generation cannot be a splice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerationManifest<'a> {
     pub base_snapshot_key: &'a str,
     pub page_size: usize,
     pub checkpoint_seq: u32,
+    /// R858-B19: the WAL header salt these frames were read under — the field
+    /// that actually names the generation, since `checkpoint_seq` resets to 0
+    /// across a writer restart. `None` only when re-formatting a pre-R858-B19
+    /// manifest; [`tail_frames`] always has one.
+    pub salt: Option<WalSalt>,
     pub first_frame: u64,
     pub last_frame: u64,
     /// R732-F2: the fencing epoch this generation was written under. `0` means
@@ -1652,27 +2306,41 @@ const MANIFEST_HEADER_V1: &str = "TURSO-BACKUP STREAM v1";
 /// matters more here than it did for fencing: an older reader that somehow
 /// skipped the batch list would look for per-frame keys that do not exist.
 const MANIFEST_HEADER_V3: &str = "TURSO-BACKUP STREAM v3";
+/// R858-B19 — carries `wal_salt`, the field that makes a generation chain
+/// checkable across a WAL recreate. Bumped for the same reason `v2` and `v3`
+/// were: [`parse_generation_manifest`] rejects unknown keys, so an older binary
+/// reading one of these would fail with `unknown manifest key: wal_salt`, which
+/// reads like corruption. Failing on the header says the true thing.
+const MANIFEST_HEADER_V4: &str = "TURSO-BACKUP STREAM v4";
 
 pub(crate) fn format_generation_manifest(m: GenerationManifest<'_>) -> String {
-    // A manifest with no batch list describes the pre-R761-F2 layout, and
-    // stamping v3 on it would promise a list that isn't there. The only way to
-    // reach this is re-formatting a legacy manifest (a test, or a repair
-    // tool); tail_frames always has batches.
-    let header = if m.frame_batches.is_empty() {
+    // Each header promises the fields that version introduced, so stamp the
+    // newest version whose promises this manifest can actually keep. The only
+    // way to reach anything but v4 is re-formatting a legacy manifest (a test,
+    // or a repair tool); tail_frames always has both a salt and batches.
+    // A v4 manifest promises BOTH the salt and the batch list, so a legacy
+    // shape missing either falls back rather than stamping a version whose
+    // promises it cannot keep. `salt` without batches has no representation and
+    // cannot occur: only tail_frames produces a salt, and it always batches.
+    let salt = if m.frame_batches.is_empty() { None } else { m.salt };
+    let header = if salt.is_some() {
+        MANIFEST_HEADER_V4
+    } else if m.frame_batches.is_empty() {
         MANIFEST_HEADER_V2
     } else {
         MANIFEST_HEADER_V3
     };
     let mut out = format!(
-        "{}\nbase_snapshot {}\npage_size {}\ncheckpoint_seq {}\nfirst_frame {}\nlast_frame {}\nepoch {}\n",
-        header,
-        m.base_snapshot_key,
-        m.page_size,
-        m.checkpoint_seq,
-        m.first_frame,
-        m.last_frame,
-        m.epoch,
+        "{}\nbase_snapshot {}\npage_size {}\ncheckpoint_seq {}\n",
+        header, m.base_snapshot_key, m.page_size, m.checkpoint_seq,
     );
+    if let Some(s) = salt {
+        out.push_str(&format!("wal_salt {}-{}\n", s.salt1, s.salt2));
+    }
+    out.push_str(&format!(
+        "first_frame {}\nlast_frame {}\nepoch {}\n",
+        m.first_frame, m.last_frame, m.epoch,
+    ));
     // Omitted rather than written empty: the parser splits on the first space,
     // so `owner ` with no value would round-trip to `Some("")`.
     if let Some(owner) = m.owner {
@@ -1692,6 +2360,11 @@ pub struct OwnedGenerationManifest {
     pub base_snapshot_key: String,
     pub page_size: usize,
     pub checkpoint_seq: u32,
+    /// R858-B19: `None` for a pre-`v4` manifest, which means the WAL
+    /// generation behind these frames was never recorded and cannot be
+    /// recovered. Unknown, not "the same as its neighbour" — see
+    /// [`validate_generation_chain`].
+    pub salt: Option<WalSalt>,
     pub first_frame: u64,
     pub last_frame: u64,
     /// R732-F2: `0` for a `v1` (pre-fencing) manifest.
@@ -1710,15 +2383,17 @@ pub struct OwnedGenerationManifest {
 pub fn parse_generation_manifest(text: &str) -> Result<OwnedGenerationManifest> {
     let mut lines = text.lines();
     let header = lines.next().context("empty generation manifest")?.trim();
-    let (v2, v3) = match header {
-        MANIFEST_HEADER_V3 => (true, true),
-        MANIFEST_HEADER_V2 => (true, false),
-        MANIFEST_HEADER_V1 => (false, false),
+    let (v2, v3, v4) = match header {
+        MANIFEST_HEADER_V4 => (true, true, true),
+        MANIFEST_HEADER_V3 => (true, true, false),
+        MANIFEST_HEADER_V2 => (true, false, false),
+        MANIFEST_HEADER_V1 => (false, false, false),
         other => anyhow::bail!("unexpected manifest header: {other:?}"),
     };
     let mut base_snapshot_key: Option<String> = None;
     let mut page_size: Option<usize> = None;
     let mut checkpoint_seq: Option<u32> = None;
+    let mut salt: Option<WalSalt> = None;
     let mut first_frame: Option<u64> = None;
     let mut last_frame: Option<u64> = None;
     let mut epoch: Option<u64> = None;
@@ -1736,6 +2411,15 @@ pub fn parse_generation_manifest(text: &str) -> Result<OwnedGenerationManifest> 
             "base_snapshot" => base_snapshot_key = Some(v.to_string()),
             "page_size" => page_size = Some(v.parse().context("page_size")?),
             "checkpoint_seq" => checkpoint_seq = Some(v.parse().context("checkpoint_seq")?),
+            "wal_salt" => {
+                let (s1, s2) = v
+                    .split_once('-')
+                    .with_context(|| format!("malformed wal_salt pair: {v:?}"))?;
+                salt = Some(WalSalt {
+                    salt1: s1.trim().parse().context("wal_salt salt1")?,
+                    salt2: s2.trim().parse().context("wal_salt salt2")?,
+                });
+            }
             "first_frame" => first_frame = Some(v.parse().context("first_frame")?),
             "last_frame" => last_frame = Some(v.parse().context("last_frame")?),
             "epoch" => epoch = Some(v.parse().context("epoch")?),
@@ -1758,6 +2442,21 @@ pub fn parse_generation_manifest(text: &str) -> Result<OwnedGenerationManifest> 
     // direction this whole mechanism must never fail in.
     if v2 && epoch.is_none() {
         anyhow::bail!("{MANIFEST_HEADER_V2} manifest is missing `epoch`");
+    }
+    // R858-B19: same reasoning as the `epoch` check above. A v4 writer always
+    // stamps the salt, so a v4 manifest without one is corrupt, not legacy —
+    // and defaulting it to `None` would silently demote a checkable generation
+    // to an unknown one, which is the direction this mechanism must never fail
+    // in. The converse guard matters just as much: a pre-v4 header carrying a
+    // `wal_salt` line is hand-edited or truncated, and trusting that salt would
+    // let a forged line wave a spliced chain through.
+    if v4 && salt.is_none() {
+        anyhow::bail!("{MANIFEST_HEADER_V4} manifest is missing `wal_salt`");
+    }
+    if !v4 && salt.is_some() {
+        anyhow::bail!(
+            "manifest header {header:?} carries a `wal_salt` line — the WAL salt is a {MANIFEST_HEADER_V4} field, so this manifest is corrupt or hand-edited"
+        );
     }
     let first_frame = first_frame.context("missing first_frame")?;
     let last_frame = last_frame.context("missing last_frame")?;
@@ -1792,6 +2491,7 @@ pub fn parse_generation_manifest(text: &str) -> Result<OwnedGenerationManifest> 
         base_snapshot_key: base_snapshot_key.context("missing base_snapshot")?,
         page_size: page_size.context("missing page_size")?,
         checkpoint_seq: checkpoint_seq.context("missing checkpoint_seq")?,
+        salt,
         first_frame,
         last_frame,
         epoch: epoch.unwrap_or(0),
@@ -1807,6 +2507,13 @@ pub fn parse_generation_manifest(text: &str) -> Result<OwnedGenerationManifest> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedWatermark {
     watermark: Watermark,
+    /// R858-B19: the WAL generation `watermark.last_frame` is a position
+    /// *within*. `generation.salt == None` marks a sidecar written before the
+    /// salt fields existed — unknown, therefore never provably equal to the
+    /// live WAL, therefore a forced restart on the next tail. That is the
+    /// deliberate choice: one redundant re-upload beats resuming into a WAL
+    /// nobody can show is the same one.
+    generation: WalGeneration,
     written_at_nanos: Option<u128>,
     /// R732-F2: the fencing epoch of the writer that last advanced this
     /// sidecar. `0` for a sidecar written before the field existed, which
@@ -1835,15 +2542,23 @@ struct PersistedWatermark {
 }
 
 /// Sidecar format:
-/// `<checkpoint_seq> <last_frame> [<written_at_unix_nanos> [<epoch> [<pointer_generation>]]]`.
+/// `<checkpoint_seq> <last_frame> [<written_at_unix_nanos> [<epoch>
+/// [<pointer_generation> [<salt1> <salt2>]]]]`.
 ///
-/// The third field was added by R574-T4, the fourth by R732-F2, and the fifth
-/// by R736-T2; all are positional appends, which is what keeps this readable
-/// in both directions. A two-, three-, or four-field sidecar (older writer)
-/// still parses, with the missing tail defaulting to `None` / `0`, and an
-/// older reader stops after its last known field and never sees the newer
-/// ones. Fields are only ever appended for exactly that reason — do not
+/// The third field was added by R574-T4, the fourth by R732-F2, the fifth by
+/// R736-T2, and the sixth and seventh by R858-B19; all are positional appends,
+/// which is what keeps this readable in both directions. A shorter sidecar (an
+/// older writer) still parses, with the missing tail defaulting to `None` /
+/// `0`, and an older reader stops after its last known field and never sees the
+/// newer ones. Fields are only ever appended for exactly that reason — do not
 /// reorder them.
+///
+/// R858-B19: a missing salt pair parses to `WalGeneration { salt: None }`,
+/// which is *unknown*, not *unchanged*. `tail_frames` restarts against it
+/// rather than resuming — see [`PersistedWatermark::generation`]. The two
+/// fields are read as a pair: a sidecar carrying only one of them is corrupt
+/// (this writer emits both or neither) and is rejected rather than
+/// half-trusted.
 async fn read_watermark(
     store: &Arc<dyn ObjectStore>,
     key: &ObjPath,
@@ -1881,11 +2596,27 @@ async fn read_watermark(
                 .map(|g| g.parse::<u64>().context("watermark pointer_generation"))
                 .transpose()?
                 .unwrap_or(0);
+            // R858-B19: both salt words or neither. A lone `salt1` is not a
+            // half-known generation, it is a torn write — say so instead of
+            // silently downgrading it to "unknown" and papering over it.
+            let salt = match (fields.next(), fields.next()) {
+                (Some(s1), Some(s2)) => Some(WalSalt {
+                    salt1: s1.parse().context("watermark salt1")?,
+                    salt2: s2.parse().context("watermark salt2")?,
+                }),
+                (None, _) => None,
+                (Some(_), None) => anyhow::bail!(
+                    "watermark sidecar carries salt1 but no salt2 — truncated or hand-edited; \
+                     refusing rather than guessing which WAL generation it names"
+                ),
+            };
+            let checkpoint_seq: u32 = seq.parse().context("watermark checkpoint_seq")?;
             Ok(Some(PersistedWatermark {
                 watermark: Watermark {
-                    checkpoint_seq: seq.parse().context("watermark checkpoint_seq")?,
+                    checkpoint_seq,
                     last_frame: frame.parse().context("watermark last_frame")?,
                 },
+                generation: WalGeneration { checkpoint_seq, salt },
                 written_at_nanos,
                 epoch,
                 pointer_generation,
@@ -1934,18 +2665,26 @@ async fn write_watermark(
     store: &Arc<dyn ObjectStore>,
     key: &ObjPath,
     w: Watermark,
+    salt: Option<WalSalt>,
     epoch: u64,
     pointer_generation: u64,
     expected: Option<&UpdateVersion>,
 ) -> Result<WatermarkCas> {
-    let body = format!(
-        "{} {} {} {} {}\n",
+    let mut body = format!(
+        "{} {} {} {} {}",
         w.checkpoint_seq,
         w.last_frame,
         unix_nanos(),
         epoch,
         pointer_generation
     );
+    // R858-B19: omitted entirely rather than written as a sentinel, so an
+    // unknown generation is one shape (absent) on both the read and write
+    // sides, and no magic value can ever be mistaken for a real salt.
+    if let Some(s) = salt {
+        body.push_str(&format!(" {} {}", s.salt1, s.salt2));
+    }
+    body.push('\n');
     let opts = PutOptions {
         mode: match expected {
             Some(v) => PutMode::Update(v.clone()),
@@ -2155,8 +2894,20 @@ mod tests {
     }
     struct MockState {
         checkpoint_seq: u32,
+        /// R858-B19: the WAL header salt this mock's frames are stamped with.
+        /// Modelled explicitly because the two fold regimes move it
+        /// differently, and the whole bug was reading only the sequence:
+        /// [`MockWal::restart`] moves both, [`MockWal::recreate`] moves only
+        /// this one.
+        salt: WalSalt,
         frames: Vec<MockFrame>,
         auto_actions_disabled: bool,
+        /// R858-B19: re-roll `salt` once this many frame reads have happened,
+        /// so a test can land a WAL recreate *inside* a single `tail_frames`
+        /// call rather than only between two. See
+        /// [`MockWal::recreate_after_reads`].
+        swap_salt_after_reads: Option<u32>,
+        reads: u32,
     }
     #[derive(Clone)]
     struct MockFrame {
@@ -2170,8 +2921,11 @@ mod tests {
                 page_size,
                 state: RefCell::new(MockState {
                     checkpoint_seq: 0,
+                    salt: WalSalt { salt1: 0xd492_ea8a, salt2: 0x7acf_42a3 },
                     frames: Vec::new(),
                     auto_actions_disabled: false,
+                    swap_salt_after_reads: None,
+                    reads: 0,
                 }),
             }
         }
@@ -2182,11 +2936,36 @@ mod tests {
                 page_bytes: vec![fill; self.page_size],
             });
         }
-        /// Simulate a WAL restart: bump checkpoint_seq, reset frames.
+        /// Simulate an **in-process** WAL restart — a long-lived connection
+        /// folding its own WAL at the autocheckpoint threshold. The WAL file is
+        /// reused, so `checkpoint_seq` advances and `salt1` advances with it
+        /// (measured `d492ea8a -> d492ea8b` alongside seq `0 -> 1`). This is
+        /// the regime the pre-R858-B19 `checkpoint_seq` test already caught.
         fn restart(&self) {
             let mut s = self.state.borrow_mut();
             s.checkpoint_seq += 1;
+            s.salt.salt1 = s.salt.salt1.wrapping_add(1);
             s.frames.clear();
+        }
+        /// R858-B19 — simulate a **writer-process restart**: the last
+        /// connection closed, SQLite checkpointed and DELETED the `-wal` file,
+        /// and the next writer created a fresh WAL. `checkpoint_seq` goes back
+        /// to 0 (it never moves, from a watcher's point of view: `0 -> 0`) and
+        /// the salt is fresh randomness, unrelated to the old one.
+        ///
+        /// This is the regime `checkpoint_seq` is blind to, and the reason the
+        /// mock models a salt at all.
+        fn recreate(&self, salt: WalSalt) {
+            let mut s = self.state.borrow_mut();
+            s.checkpoint_seq = 0;
+            s.salt = salt;
+            s.frames.clear();
+        }
+        /// R858-B19: arm a mid-call WAL recreate — the salt flips once `reads`
+        /// frame reads have been served, which lands it inside the drain loop
+        /// rather than between two `tail_frames` calls.
+        fn recreate_after_reads(&self, reads: u32) {
+            self.state.borrow_mut().swap_salt_after_reads = Some(reads);
         }
         fn frame_count(&self) -> u64 {
             self.state.borrow().frames.len() as u64
@@ -2202,7 +2981,11 @@ mod tests {
             })
         }
         fn wal_get_frame(&self, frame_no: u64, buf: &mut [u8]) -> Result<FrameInfo> {
-            let s = self.state.borrow();
+            let mut s = self.state.borrow_mut();
+            s.reads += 1;
+            if s.swap_salt_after_reads == Some(s.reads) {
+                s.salt.salt1 = !s.salt.salt1;
+            }
             let idx = frame_no
                 .checked_sub(1)
                 .context("frame_no must be >= 1")? as usize;
@@ -2210,11 +2993,14 @@ mod tests {
                 .frames
                 .get(idx)
                 .with_context(|| format!("frame {frame_no} out of range"))?;
-            // Synthesize a 24-byte header: big-endian page_no, db_size, then
-            // zeros for salts/checksums (we never validate those).
+            // Synthesize a 24-byte header: big-endian page_no, db_size, the
+            // WAL's salt pair (R858-B19 reads the generation out of exactly
+            // these bytes), then zeros for the checksums (never validated).
             buf[0..4].copy_from_slice(&f.info.page_no.to_be_bytes());
             buf[4..8].copy_from_slice(&f.info.db_size.to_be_bytes());
-            buf[8..WAL_FRAME_HEADER_SIZE].fill(0);
+            buf[8..12].copy_from_slice(&s.salt.salt1.to_be_bytes());
+            buf[12..16].copy_from_slice(&s.salt.salt2.to_be_bytes());
+            buf[16..WAL_FRAME_HEADER_SIZE].fill(0);
             buf[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&f.page_bytes);
             Ok(f.info)
         }
@@ -2810,7 +3596,15 @@ mod tests {
         assert_eq!(legacy.written_at_nanos, None);
 
         // A tail against the legacy sidecar reports unknown age (not a
-        // breach), streams the new frames, and re-stamps the sidecar.
+        // breach), uploads the frames, and re-stamps the sidecar.
+        //
+        // R858-B19 CHANGED THE OUTCOME HERE, deliberately: this used to assert
+        // `Streamed` with `first_frame == 2` ("resumes after the legacy
+        // watermark"). A two-field sidecar records no salt, so nothing says the
+        // WAL it names is the WAL in front of us — and resuming at frame 2 on
+        // that basis is the exact inference that spliced two generations. The
+        // sidecar's RPO semantics (an *unknown* age is not a breach) are what
+        // this test is about and they are untouched.
         let seam = MockWal::new(4096);
         seam.append(1, 0, 0xAA);
         seam.append(2, 2, 0xBB);
@@ -2818,12 +3612,13 @@ mod tests {
         cfg.rpo_target = Some(Duration::ZERO);
         let out = tail_frames(&seam, &target, &cfg).await.unwrap();
         match out {
-            StreamOutcome::Streamed { rpo, first_frame, .. } => {
-                assert_eq!(first_frame, 2, "resumes after the legacy watermark");
+            StreamOutcome::Restarted { rpo, first_frame, previous_generation, .. } => {
+                assert_eq!(first_frame, 1, "an unverifiable watermark is re-uploaded, not resumed");
+                assert_eq!(previous_generation.salt, None);
                 assert_eq!(rpo.watermark_age, None);
                 assert!(!rpo.breached, "unknown age is not a breach even at zero target");
             }
-            other => panic!("expected Streamed, got {other:?}"),
+            other => panic!("expected Restarted, got {other:?}"),
         }
         let upgraded = read_watermark(&target.store, &target.watermark_key())
             .await
@@ -2837,6 +3632,7 @@ mod tests {
     fn rpo_status_truth_table() {
         let stamped = |nanos_ago: u128| PersistedWatermark {
             watermark: Watermark { checkpoint_seq: 0, last_frame: 1 },
+            generation: WalGeneration::default(),
             written_at_nanos: Some(unix_nanos().saturating_sub(nanos_ago)),
             epoch: 0,
             pointer_generation: 0,
@@ -2848,6 +3644,7 @@ mod tests {
         // Prior without a stamp (legacy sidecar).
         let legacy = PersistedWatermark {
             watermark: Watermark::default(),
+            generation: WalGeneration::default(),
             written_at_nanos: None,
             epoch: 0,
             pointer_generation: 0,
@@ -2966,8 +3763,11 @@ mod tests {
         assert_eq!(
             StreamOutcome::Restarted {
                 generation_key: String::new(),
-                previous_checkpoint_seq: 0,
-                new_checkpoint_seq: 1,
+                previous_generation: WalGeneration::default(),
+                new_generation: WalGeneration {
+                    checkpoint_seq: 1,
+                    salt: Some(WalSalt { salt1: 1, salt2: 2 }),
+                },
                 first_frame: 1,
                 last_frame: 1,
                 frame_count: 1,
@@ -3187,15 +3987,18 @@ mod tests {
         let out = tail_frames(&seam, &target, &cfg()).await.unwrap();
         match out {
             StreamOutcome::Restarted {
-                previous_checkpoint_seq,
-                new_checkpoint_seq,
+                previous_generation,
+                new_generation,
                 first_frame,
                 last_frame,
                 frame_count,
                 ..
             } => {
-                assert_eq!(previous_checkpoint_seq, 0);
-                assert_eq!(new_checkpoint_seq, 1);
+                assert_eq!(previous_generation.checkpoint_seq, 0);
+                assert_eq!(new_generation.checkpoint_seq, 1);
+                // R858-B19: an in-process restart moves the salt too, so this
+                // regime is now caught twice over.
+                assert_ne!(previous_generation.salt, new_generation.salt);
                 assert_eq!(first_frame, 1);
                 assert_eq!(last_frame, 1);
                 assert_eq!(frame_count, 1);
@@ -3215,6 +4018,246 @@ mod tests {
             .get(&target.frame_batch_key(0, 1, 1, 1))
             .await
             .unwrap();
+    }
+
+    /// R858-B19, the property this whole ticket turns on: **a WAL whose salt
+    /// changed is a different WAL, even when `checkpoint_seq` did not move.**
+    ///
+    /// This is the writer-process-restart regime. The last connection closed,
+    /// SQLite checkpointed and deleted the `-wal`, and the next writer built a
+    /// fresh WAL back at checkpoint-sequence 0. Both tails therefore see
+    /// `checkpoint_seq == 0`, which is precisely why the old
+    /// `p.checkpoint_seq == current.checkpoint_seq` test resumed at
+    /// `last_frame + 1` and spliced frames from two unrelated WALs into one
+    /// generation chain — a restore that reported success and produced a stale
+    /// or malformed image, with nothing raised anywhere.
+    ///
+    /// The probe (`examples/foreign_checkpoint_probe.rs -- b f`) drives the
+    /// same fold end-to-end against the real system `sqlite3`. This test exists
+    /// so the property is pinned here too: the probe needs an upstream sqlite3
+    /// binary and half a minute, and a property this load-bearing should fail
+    /// in `cargo test` when someone re-derives "the sequence is enough".
+    #[tokio::test]
+    async fn a_salt_change_is_a_restart_even_when_checkpoint_seq_is_unchanged() {
+        let seam = MockWal::new(4096);
+        seam.append(1, 1, 0xAA);
+        seam.append(2, 2, 0xBB);
+        seam.append(3, 3, 0xCC);
+        let target = fresh_target();
+        let first = tail_frames(&seam, &target, &cfg()).await.unwrap();
+        assert!(matches!(first, StreamOutcome::Streamed { .. }), "got {first:?}");
+
+        // The foreign writer restarted: brand-new WAL, unrelated salt, and a
+        // checkpoint-sequence that reads 0 both before and after.
+        seam.recreate(WalSalt { salt1: 0x9ca8_9e29, salt2: 0x2be5_66fc });
+        seam.append(1, 1, 0xDD);
+        seam.append(2, 2, 0xEE);
+        assert_eq!(
+            seam.wal_state().unwrap().checkpoint_seq,
+            0,
+            "the premise: the sequence did NOT move across the recreate"
+        );
+
+        let out = tail_frames(&seam, &target, &cfg()).await.unwrap();
+        let StreamOutcome::Restarted {
+            previous_generation,
+            new_generation,
+            first_frame,
+            last_frame,
+            ..
+        } = &out
+        else {
+            panic!(
+                "a recreated WAL must report Restarted — got {out:?}. If this is Streamed with \
+                 first_frame 4, the salt check has been removed and two WAL generations are being \
+                 spliced into one chain again (R858-B19)"
+            );
+        };
+        assert_eq!(previous_generation.checkpoint_seq, new_generation.checkpoint_seq);
+        assert_ne!(
+            previous_generation.salt, new_generation.salt,
+            "the salt is the only thing that moved, and it is what must be noticed"
+        );
+        assert_eq!((*first_frame, *last_frame), (1, 2), "re-upload from the top of the new WAL");
+
+        // And the chain that results is refused rather than restored: two
+        // generations both starting at frame 1 is not a stream, and restore
+        // must say so instead of producing a plausible-looking wrong image.
+        let manifests = list_and_parse_generation_manifests(&target).await.unwrap();
+        assert_eq!(manifests.len(), 2);
+        let err = validate_generation_chain(&manifests).unwrap_err().to_string();
+        assert!(
+            err.contains("WAL") || err.contains("gap in stream"),
+            "restore must refuse the post-recreate chain loudly, got: {err}"
+        );
+    }
+
+    /// R858-B19 — the narrower door: a WAL recreate that lands **inside** one
+    /// `tail_frames` call rather than between two. The pre-drain sample says
+    /// generation A, the frames that got read are a mix of A and B, and no
+    /// comparison of two watermarks can see it. The call must publish nothing.
+    #[tokio::test]
+    async fn a_wal_recreated_mid_drain_publishes_nothing() {
+        let seam = MockWal::new(4096);
+        for n in 1..=3u32 {
+            seam.append(n, n, n as u8);
+        }
+        let target = fresh_target();
+        // Read #1 is the pre-drain salt probe; reads #2..#4 are the drain. Flip
+        // the WAL underneath us on the second frame of the drain.
+        seam.recreate_after_reads(3);
+
+        let err = tail_frames(&seam, &target, &cfg()).await.unwrap_err().to_string();
+        assert!(err.contains("recreated while this tail was uploading"), "got: {err}");
+
+        // The sink is untouched: no watermark to resume from, no manifest to
+        // restore. Whatever frame objects landed are orphaned and unreferenced.
+        assert!(read_watermark(&target.store, &target.watermark_key()).await.unwrap().is_none());
+        assert!(list_and_parse_generation_manifests(&target).await.unwrap().is_empty());
+    }
+
+    /// R858-B19 — the sidecar half of the same property. A watermark persisted
+    /// by a pre-salt writer says nothing about which WAL it names, so the next
+    /// tail must restart rather than resume from `last_frame + 1`. Unknown is
+    /// not "unchanged".
+    #[tokio::test]
+    async fn a_saltless_legacy_watermark_forces_a_restart_rather_than_a_resume() {
+        let target = fresh_target();
+        // Exactly what a pre-R858-B19 writer left behind: five positional
+        // fields, no salt pair.
+        target
+            .store
+            .put(&target.watermark_key(), format!("0 2 {} 0 0\n", unix_nanos()).into_bytes().into())
+            .await
+            .unwrap();
+
+        let seam = MockWal::new(4096);
+        seam.append(1, 1, 0xAA);
+        seam.append(2, 2, 0xBB);
+        seam.append(3, 3, 0xCC);
+
+        let out = tail_frames(&seam, &target, &cfg()).await.unwrap();
+        let StreamOutcome::Restarted { previous_generation, first_frame, .. } = &out else {
+            panic!(
+                "an unverifiable watermark must restart, not resume — got {out:?}. Resuming here \
+                 trusts a position in a WAL nobody can show is the same one (R858-B19)"
+            );
+        };
+        assert_eq!(previous_generation.salt, None, "the prior generation is unknown, not equal");
+        assert_eq!(*first_frame, 1, "re-upload everything rather than trust the old position");
+
+        // Self-healing: the sidecar now carries a salt, so the very next tail
+        // resumes normally. One redundant re-upload, not a permanent restart
+        // loop.
+        seam.append(4, 4, 0xDD);
+        let next = tail_frames(&seam, &target, &cfg()).await.unwrap();
+        let StreamOutcome::Streamed { first_frame, .. } = &next else {
+            panic!("the salt is recorded now, so this must resume — got {next:?}");
+        };
+        assert_eq!(*first_frame, 4);
+    }
+
+    /// R858-B19 — the restore-side refusal, on the shape a pre-`v4` writer
+    /// could actually leave in a bucket: a chain that looks perfectly
+    /// contiguous but whose manifests never recorded which WAL they came from.
+    /// `checkpoint_seq` agrees, the frame ranges tile, and it is still
+    /// unrestorable, because that is exactly what a splice looks like.
+    #[test]
+    fn validate_chain_refuses_a_multi_generation_chain_with_no_recorded_salt() {
+        let err = validate_generation_chain(&[
+            mk_manifest_salted("base.db", 4096, 0, None, 1, 5),
+            mk_manifest_salted("base.db", 4096, 0, None, 6, 9),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no WAL salt"), "got: {err}");
+
+        // One generation is not a splice — a legacy single-manifest backup
+        // stays restorable, because there is nothing here to prove.
+        let chain =
+            validate_generation_chain(&[mk_manifest_salted("base.db", 4096, 0, None, 1, 5)])
+                .unwrap();
+        assert_eq!(chain.generation.salt, None);
+        assert_eq!(chain.total_frames, 5);
+    }
+
+    /// R858-B19 — and the same refusal when the salts are recorded and
+    /// *disagree*: a contiguous frame range across two different WALs. This is
+    /// the case `checkpoint_seq` can never catch, since a recreate resets it to
+    /// the value it already had.
+    #[test]
+    fn validate_chain_refuses_a_chain_whose_salt_changes_mid_stream() {
+        let other = WalSalt { salt1: 0xea10_2175, salt2: 0xb4ff_221f };
+        let err = validate_generation_chain(&[
+            mk_manifest_salted("base.db", 4096, 0, Some(CHAIN_SALT), 1, 30),
+            mk_manifest_salted("base.db", 4096, 0, Some(other), 31, 57),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("RECREATED mid-stream"), "got: {err}");
+    }
+
+    /// R858-B19 — manifest `v4` carries the salt, and the version guards move
+    /// with it: a `v4` header without a `wal_salt` is corrupt (not legacy), and
+    /// a pre-`v4` header *with* one is forged (not a newer writer).
+    #[test]
+    fn manifest_v4_round_trips_the_wal_salt_and_guards_both_directions() {
+        let batches = [(12u64, 34u64)];
+        let salt = WalSalt { salt1: 0xb83c_03f5, salt2: 0x0000_0001 };
+        let text = format_generation_manifest(GenerationManifest {
+            base_snapshot_key: "backups/snapshots/snapshot-1.db",
+            page_size: 4096,
+            checkpoint_seq: 7,
+            salt: Some(salt),
+            first_frame: 12,
+            last_frame: 34,
+            epoch: 9,
+            owner: Some("node-3"),
+            frame_batches: &batches,
+        });
+        assert!(text.starts_with(MANIFEST_HEADER_V4), "got: {text}");
+        let parsed = parse_generation_manifest(&text).unwrap();
+        assert_eq!(parsed.salt, Some(salt));
+        assert_eq!(parsed.checkpoint_seq, 7);
+        assert_eq!(parsed.frame_batches, batches);
+
+        let no_salt = text.replace(&format!("wal_salt {}-{}\n", salt.salt1, salt.salt2), "");
+        let err = parse_generation_manifest(&no_salt).unwrap_err().to_string();
+        assert!(err.contains("missing `wal_salt`"), "got: {err}");
+
+        let forged = text.replace(MANIFEST_HEADER_V4, MANIFEST_HEADER_V3);
+        let err = parse_generation_manifest(&forged).unwrap_err().to_string();
+        assert!(err.contains("corrupt or hand-edited"), "got: {err}");
+    }
+
+    /// R858-B19 — the sidecar's salt pair is read as a pair. Half a pair is a
+    /// torn write, and downgrading it to "unknown" would hide that.
+    #[tokio::test]
+    async fn watermark_sidecar_round_trips_the_salt_and_rejects_half_a_pair() {
+        let target = fresh_target();
+        let key = target.watermark_key();
+        let salt = WalSalt { salt1: 0xd492_ea8a, salt2: 0x7acf_42a3 };
+        write_watermark(
+            &target.store,
+            &key,
+            Watermark { checkpoint_seq: 2, last_frame: 11 },
+            Some(salt),
+            6,
+            3,
+            None,
+        )
+        .await
+        .unwrap();
+        let read = read_watermark(&target.store, &key).await.unwrap().unwrap();
+        assert_eq!(read.generation, WalGeneration { checkpoint_seq: 2, salt: Some(salt) });
+
+        target
+            .store
+            .put(&key, format!("2 11 {} 6 3 {}\n", unix_nanos(), salt.salt1).into_bytes().into())
+            .await
+            .unwrap();
+        let err = read_watermark(&target.store, &key).await.unwrap_err().to_string();
+        assert!(err.contains("salt1 but no salt2"), "got: {err}");
     }
 
     /// Captured frame insert: a mock [`WalInsertSeam`] records every call so
@@ -3260,10 +4303,35 @@ mod tests {
         first_frame: u64,
         last_frame: u64,
     ) -> OwnedGenerationManifest {
+        mk_manifest_salted(
+            base,
+            page_size,
+            checkpoint_seq,
+            Some(CHAIN_SALT),
+            first_frame,
+            last_frame,
+        )
+    }
+
+    /// R858-B19: the salt every `mk_manifest` fixture shares, so a chain built
+    /// from them is one generation unless a test deliberately says otherwise.
+    const CHAIN_SALT: WalSalt = WalSalt { salt1: 0x1109_ca5e, salt2: 0x7acf_42a3 };
+
+    /// R858-B19: `mk_manifest` with the generation salt spelled out — `None`
+    /// reproduces a manifest written by a pre-`v4` writer.
+    fn mk_manifest_salted(
+        base: &str,
+        page_size: usize,
+        checkpoint_seq: u32,
+        salt: Option<WalSalt>,
+        first_frame: u64,
+        last_frame: u64,
+    ) -> OwnedGenerationManifest {
         OwnedGenerationManifest {
             base_snapshot_key: base.to_string(),
             page_size,
             checkpoint_seq,
+            salt,
             first_frame,
             last_frame,
             epoch: 0,
@@ -3281,7 +4349,7 @@ mod tests {
         let chain = validate_generation_chain(&[mk_manifest("base.db", 4096, 0, 1, 5)]).unwrap();
         assert_eq!(chain.base_snapshot_key, "base.db");
         assert_eq!(chain.page_size, 4096);
-        assert_eq!(chain.checkpoint_seq, 0);
+        assert_eq!(chain.generation.checkpoint_seq, 0);
         assert_eq!(chain.total_frames, 5);
     }
 
@@ -3295,7 +4363,7 @@ mod tests {
             mk_manifest("base.db", 4096, 3, 10, 12),
         ])
         .unwrap();
-        assert_eq!(chain.checkpoint_seq, 3);
+        assert_eq!(chain.generation.checkpoint_seq, 3);
         assert_eq!(chain.total_frames, 12);
     }
 
@@ -3437,6 +4505,7 @@ mod tests {
             base_snapshot_key: "b.db",
             page_size: 4096,
             checkpoint_seq: 0,
+            salt: None,
             first_frame: 1,
             last_frame: 2,
             epoch: 0,
@@ -3462,6 +4531,7 @@ mod tests {
             base_snapshot_key: "b.db",
             page_size: 4096,
             checkpoint_seq: 0,
+            salt: None,
             first_frame: 3,
             last_frame: 4,
             epoch: 0,
@@ -3477,7 +4547,21 @@ mod tests {
         let manifests = list_and_parse_generation_manifests(&target).await.unwrap();
         assert!(manifests[0].frame_batches.is_empty(), "gen 1 is the legacy layout");
         assert_eq!(manifests[1].frame_batches, vec![(3, 4)]);
-        validate_generation_chain(&manifests).expect("layout is not a chain property");
+
+        // R858-B19 CHANGED THIS ASSERTION, deliberately. It used to read
+        // `validate_generation_chain(&manifests).expect("layout is not a chain
+        // property")`. Layout still is not a chain property — that claim is
+        // what the replay assertion below tests, and it still holds. What
+        // changed is PROVENANCE: this fixture is a two-generation chain in
+        // which neither manifest records which WAL its frames came from,
+        // because both predate the `wal_salt` field. That is byte-for-byte the
+        // shape a WAL recreate produced (probe F: contiguous ranges, one
+        // checkpoint_seq, two different WALs), so restore can no longer tell
+        // this chain from a spliced one and must refuse rather than hand back a
+        // plausible wrong image. A chain this old needs a fresh tier-1a
+        // snapshot; one generation of it would still restore.
+        let err = validate_generation_chain(&manifests).unwrap_err().to_string();
+        assert!(err.contains("no WAL salt"), "got: {err}");
 
         let insert = MockInsertSeam::new();
         assert_eq!(replay_frames_into(&target, &insert, &manifests).await.unwrap(), 4);
@@ -3779,6 +4863,7 @@ mod tests {
             base_snapshot_key: &m.base_snapshot_key,
             page_size: m.page_size,
             checkpoint_seq: m.checkpoint_seq,
+            salt: None,
             first_frame: m.first_frame,
             last_frame: m.last_frame,
             epoch: m.epoch,
@@ -3909,6 +4994,170 @@ mod tests {
             rows, 35,
             "expected 25 (checkpointed) + 10 (replayed from WAL)"
         );
+    }
+
+    // ── R858-B18: reading a source nobody will lock for us ────────────────
+    //
+    // The property under test throughout: the copy is either a validated
+    // point in time or a refusal, never a plausible wrong image.
+
+    /// The two salt readers must agree. [`read_wal_salt`] pulls it out of frame
+    /// 1 through the [`WalSeam`] trait (the only path a `from_conn` seam has);
+    /// [`WalFileHeader::read`] pulls it out of the 32-byte `-wal` header with no
+    /// engine at all. They are separate code paths against separate byte
+    /// offsets, and R858-B18 depends on them naming the same generation — if
+    /// they could disagree, validation would compare a salt the streamer never
+    /// recorded.
+    #[tokio::test]
+    async fn wal_file_header_salt_matches_the_salt_read_through_the_seam() {
+        let src = TempDb::new("b18-salt-agree");
+        seed_rows(src.path(), 0, 5).await;
+
+        let seam = CoreWalSeam::open_reader(src.path()).unwrap();
+        let state = seam.wal_state().unwrap();
+        assert!(state.last_frame > 0, "seed should leave frames in the WAL");
+        let via_seam = read_wal_salt(&seam, 4096, state.last_frame).unwrap().unwrap();
+        drop(seam);
+
+        let via_file = WalFileHeader::read(src.path()).unwrap().unwrap();
+        assert_eq!(via_file.salt, via_seam, "frame 1 carries the WAL header's salt verbatim");
+        assert_eq!(
+            via_file.checkpoint_seq, state.checkpoint_seq,
+            "and the on-disk sequence is the one the engine reports"
+        );
+    }
+
+    /// A `-wal` shorter than one header names no generation — an honest
+    /// unknown, not an error (same posture as `WalGeneration { salt: None }`).
+    #[test]
+    fn wal_file_header_parse_needs_a_whole_header() {
+        assert!(WalFileHeader::parse(&[0u8; WalFileHeader::SIZE - 1]).is_none());
+        let mut hdr = [0u8; WalFileHeader::SIZE];
+        hdr[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        hdr[12..16].copy_from_slice(&7u32.to_be_bytes());
+        hdr[16..20].copy_from_slice(&0xb83c_03f5u32.to_be_bytes());
+        hdr[20..24].copy_from_slice(&0x7acf_42a3u32.to_be_bytes());
+        let parsed = WalFileHeader::parse(&hdr).unwrap();
+        assert_eq!(parsed.page_size, 4096);
+        assert_eq!(parsed.checkpoint_seq, 7);
+        assert_eq!(parsed.salt, WalSalt { salt1: 0xb83c_03f5, salt2: 0x7acf_42a3 });
+    }
+
+    /// The central asymmetry of [`SourceFingerprint::stable_across`]: a plain
+    /// append is NOT movement (frames `1..=max_frame` are immutable within a
+    /// generation, so our image is merely an earlier point in time), while a
+    /// checkpoint IS (it rewrites the main file our copy already read).
+    ///
+    /// Getting this backwards is not a small error in either direction: treat
+    /// an append as movement and every copy of a database that is actually in
+    /// use is refused; treat a checkpoint as harmless and we hand back spliced
+    /// state that passes `integrity_check`.
+    #[tokio::test]
+    async fn fingerprint_ignores_an_append_and_catches_a_checkpoint() {
+        let src = TempDb::new("b18-fingerprint");
+        seed_rows(src.path(), 0, 5).await;
+
+        let before = SourceFingerprint::read(src.path()).unwrap();
+        seed_rows(src.path(), 100, 5).await;
+        let appended = SourceFingerprint::read(src.path()).unwrap();
+        assert!(
+            appended.wal_len > before.wal_len,
+            "the append must actually have grown the WAL, or this proves nothing \
+             (before {}B, after {}B)",
+            before.wal_len,
+            appended.wal_len
+        );
+        assert!(
+            before.stable_across(&appended),
+            "an append is not movement: {} -> {}",
+            before.describe(),
+            appended.describe()
+        );
+
+        checkpoint_truncate(src.path()).await;
+        let folded = SourceFingerprint::read(src.path()).unwrap();
+        assert!(
+            !before.stable_across(&folded),
+            "a checkpoint IS movement and must be caught: {} -> {}",
+            before.describe(),
+            folded.describe()
+        );
+    }
+
+    /// The protocol accepts when the source holds still, and the accepted value
+    /// is the one the attempt produced.
+    #[tokio::test]
+    async fn validation_accepts_a_quiescent_source() {
+        let src = TempDb::new("b18-quiescent");
+        seed_rows(src.path(), 0, 3).await;
+        let got = validated_against_source(src.path(), "test read", || async { Ok(41 + 1) })
+            .await
+            .unwrap();
+        assert_eq!(got, 42);
+    }
+
+    /// A source that moves under every attempt yields a REFUSAL, not a value —
+    /// and the message names both samples so an operator can see what moved.
+    #[tokio::test]
+    async fn validation_refuses_when_the_source_moves_under_every_attempt() {
+        let src = TempDb::new("b18-moving");
+        seed_rows(src.path(), 0, 3).await;
+        let path = src.path().to_string();
+        let attempts = std::cell::Cell::new(0u32);
+        let err = validated_against_source(src.path(), "test read", || {
+            // Grow the main file inside the attempt window, which is exactly
+            // the shape of a foreign checkpoint folding pages into it.
+            attempts.set(attempts.get() + 1);
+            let path = path.clone();
+            async move {
+                let mut f = std::fs::OpenOptions::new().append(true).open(&path)?;
+                std::io::Write::write_all(&mut f, &[0u8; 4096])?;
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            attempts.get(),
+            COPY_VALIDATION_ATTEMPTS,
+            "every attempt in the budget must be spent before refusing"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing a test read"), "{msg}");
+        assert!(msg.contains("before and"), "message must name both samples: {msg}");
+    }
+
+    /// An attempt that fails against a source that did NOT move is a real
+    /// error, not a race — it is returned as itself on the first attempt rather
+    /// than retried and then reported as concurrency.
+    #[tokio::test]
+    async fn validation_surfaces_a_real_error_without_burning_the_budget() {
+        let src = TempDb::new("b18-real-error");
+        seed_rows(src.path(), 0, 3).await;
+        let attempts = std::cell::Cell::new(0u32);
+        let err = validated_against_source(src.path(), "test read", || {
+            attempts.set(attempts.get() + 1);
+            async { Err::<(), _>(anyhow::anyhow!("page 3 checksum mismatch")) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(attempts.get(), 1, "a stable source means retrying cannot help");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("did NOT move"), "{msg}");
+        assert!(msg.contains("page 3 checksum mismatch"), "{msg}");
+    }
+
+    /// The reader open is the one the backup path uses, and it must produce the
+    /// same watermark the writable open does. (Cross-process non-exclusivity —
+    /// the point of the flag — is measured in `examples/foreign_checkpoint_probe.rs`
+    /// probes G2r/G3c, since it needs a second process.)
+    #[tokio::test]
+    async fn read_only_seam_reports_the_same_watermark_as_the_writable_one() {
+        let src = TempDb::new("b18-reader-watermark");
+        seed_rows(src.path(), 0, 4).await;
+        let writable = CoreWalSeam::open(src.path()).unwrap().wal_state().unwrap();
+        let reader = CoreWalSeam::open_reader(src.path()).unwrap().wal_state().unwrap();
+        assert_eq!(writable, reader);
     }
 
     /// A second call to `raw_consistent_copy_live` after more writes captures
@@ -4104,6 +5353,7 @@ mod tests {
             &target.store,
             &key,
             Watermark { checkpoint_seq: 2, last_frame: 11 },
+            None,
             6,
             3,
             None,
@@ -4144,6 +5394,7 @@ mod tests {
                 checkpoint_seq: 2,
                 last_frame: 11,
             },
+            None,
             6,
             3,
             None,
@@ -4338,6 +5589,7 @@ mod tests {
             base_snapshot_key: "backups/snapshots/snapshot-1.db",
             page_size: 4096,
             checkpoint_seq: 7,
+            salt: None,
             first_frame: 12,
             last_frame: 34,
             epoch: 9,
@@ -4354,6 +5606,7 @@ mod tests {
             base_snapshot_key: "b.db",
             page_size: 4096,
             checkpoint_seq: 0,
+            salt: None,
             first_frame: 1,
             last_frame: 1,
             epoch: 1,
@@ -4374,6 +5627,7 @@ mod tests {
             base_snapshot_key: "backups/snapshots/snapshot-1.db",
             page_size: 4096,
             checkpoint_seq: 7,
+            salt: None,
             first_frame: 12,
             last_frame: 34,
             epoch: 9,
@@ -4452,6 +5706,7 @@ mod tests {
             &target.store,
             &key,
             Watermark { checkpoint_seq: 2, last_frame: 11 },
+            None,
             6,
             0,
             None,
@@ -4556,11 +5811,11 @@ mod tests {
         let key = target.watermark_key();
         let w = Watermark { checkpoint_seq: 0, last_frame: 1 };
         assert_eq!(
-            write_watermark(&target.store, &key, w, 1, 0, None).await.unwrap(),
+            write_watermark(&target.store, &key, w, None, 1, 0, None).await.unwrap(),
             WatermarkCas::Advanced
         );
         assert_eq!(
-            write_watermark(&target.store, &key, w, 1, 0, None).await.unwrap(),
+            write_watermark(&target.store, &key, w, None, 1, 0, None).await.unwrap(),
             WatermarkCas::Contended,
             "the sink already exists — Create must not silently overwrite it"
         );
@@ -4576,6 +5831,7 @@ mod tests {
             &target.store,
             &key,
             Watermark { checkpoint_seq: 0, last_frame: 1 },
+            None,
             1,
             0,
             None,
@@ -4590,6 +5846,7 @@ mod tests {
             &target.store,
             &key,
             Watermark { checkpoint_seq: 0, last_frame: 5 },
+            None,
             2,
             0,
             read_watermark(&target.store, &key)
@@ -4607,6 +5864,7 @@ mod tests {
                 &target.store,
                 &key,
                 Watermark { checkpoint_seq: 0, last_frame: 2 },
+                None,
                 1,
                 0,
                 stale.version.as_ref(),
@@ -4631,6 +5889,7 @@ mod tests {
             &target.store,
             &key,
             Watermark { checkpoint_seq: 0, last_frame: 1 },
+            None,
             1,
             0,
             None,
@@ -4643,6 +5902,7 @@ mod tests {
                 &target.store,
                 &key,
                 Watermark { checkpoint_seq: 0, last_frame: 7 },
+                None,
                 1,
                 0,
                 cur.version.as_ref(),
@@ -4872,6 +6132,7 @@ mod tests {
             base_snapshot_key: "backups/snapshots/snapshot-1.db",
             page_size: 4096,
             checkpoint_seq: 7,
+            salt: None,
             first_frame: 12,
             last_frame: 34,
             epoch: 0,

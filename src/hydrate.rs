@@ -205,7 +205,11 @@ pub fn inspect_volume(
 
 /// Join a volume-relative subject onto the volume root, refusing anything that
 /// would land outside it.
-fn subject_path(volume_root: &Path, subject: &str) -> Result<PathBuf> {
+///
+/// Public since R850-F1's tail half: the backup side must resolve exactly the
+/// same subject to exactly the same file the restore side writes, and a second
+/// implementation of that join is a second traversal check to get wrong.
+pub fn subject_path(volume_root: &Path, subject: &str) -> Result<PathBuf> {
     if subject.is_empty() {
         bail!("empty subject path");
     }

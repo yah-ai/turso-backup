@@ -295,6 +295,23 @@ mod tests {
         // The measured figure is the point: this is what a recovery estimate
         // built from a declared `state-mb` and a constant should be replaced by.
         assert!(line.contains("\"seconds\":12.500"), "{line}");
+
+        // R850-T2: yubaba's `cloud::recovery_journal` parses THIS line to turn
+        // the extrapolated `RecoveryEstimate::Hydrate` into a measured one, and
+        // `cloud` deliberately takes no dependency on this crate. The coupling
+        // is therefore pinned from both sides by this literal, which is
+        // byte-identical to `REAL_HYDRATE_LINE` in
+        // `oss/yubaba/crates/cloud/src/recovery_journal.rs`. Changing this
+        // format string without changing that constant fails here first.
+        assert_eq!(
+            line,
+            concat!(
+                r#"{"outcome":"hydrated","epoch":4,"subjects":1,"bytes":1024,"seconds":12.500,"#,
+                r#""restored":[{"subject":"accounts.db","#,
+                r#""source":"wl/acct/accounts.db/snapshots/snapshot-000.db","#,
+                r#""bytes":1024,"seconds":12.250}]}"#,
+            )
+        );
     }
 
     /// A supervisor branches on `reason`, not on the prose — so every refusal

@@ -14,6 +14,11 @@
 //!   spill backpressure ([`backpressure`]), one-puller-per-box fan-out
 //!   ([`puller`]), and a [`stream::probe_conditional_puts`] preflight.
 //!
+//! Both streaming tiers accumulate garbage a writer deliberately does not
+//! delete, and each has an explicitly-invoked sweep that does:
+//! [`dedup::gc_dedup`] for 1b's `pages/`, [`stream::gc_stream`] for 2's
+//! superseded base snapshots and orphaned frame prefixes.
+//!
 //! This header called tier 2 "deferred, engine-coupled" until 2026-08-28. It
 //! was neither by then: `stream.rs` had shipped in R005-F2/F3 and grown fencing
 //! (R732-F2), the RPO watermark (R574-T4) and frame batching (R761-F2). The

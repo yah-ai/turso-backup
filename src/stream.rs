@@ -192,7 +192,7 @@
 use anyhow::{Context, Result};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1955,7 +1955,7 @@ pub(crate) fn validate_generation_chain(
 /// were delivered.
 ///
 /// R761-F2: the one read path that resolves a manifest to frame bytes,
-/// batched or not — [`BackupTarget::frame_objects_of`] decides which layout
+/// batched or not — `BackupTarget::frame_objects_of` decides which layout
 /// the generation used, and a batch object is split here at
 /// `24 + page_size` boundaries. Both restore's replay and
 /// [`crate::puller::WalPuller`] call it, so a layout the writer can produce
@@ -2875,6 +2875,299 @@ fn unix_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+/// Default [`StreamGcConfig::grace`] — 24 hours.
+///
+/// Conservative on purpose. The window has to cover the longest gap between an
+/// object becoming unreachable-looking and a live reader or writer finishing
+/// with it, and there are three such gaps, the largest of which is not bounded
+/// by anything this crate controls:
+///
+/// 1. **A restore in flight.** [`restore_stream_from_manifests`] lists the
+///    chain, then fetches the base, then walks every frame object one at a
+///    time with the GETs serialized (see
+///    [`list_and_parse_generation_manifests`] on why). A cold restore of a
+///    large database over a slow link is minutes to hours, and it is reading
+///    objects it named *before* the GC listed anything.
+/// 2. **A tail mid-upload.** [`tail_frames`] uploads frame batches and only
+///    then writes the generation manifest naming them, so between those two
+///    points a perfectly live batch is referenced by no manifest and looks
+///    exactly like an orphan.
+/// 3. **A rebase mid-flight.** `crate::tail::rebase` publishes the new base
+///    *before* deleting the old generation manifests, so in that window the
+///    surviving manifests name the OLD base and the new one is reachable from
+///    nothing. The grace window is the only thing that keeps a concurrent GC
+///    from deleting the base a recovery just published.
+///
+/// 24 hours also swallows clock skew between the object store's
+/// `last_modified` and this process's wall clock, which is what the age
+/// comparison is made against. A day of retained garbage costs storage; an
+/// hour too few costs a restore.
+pub const DEFAULT_STREAM_GC_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Knobs for [`gc_stream`].
+///
+/// [`Default`] is `{ grace: DEFAULT_STREAM_GC_GRACE, dry_run: true }` — the
+/// posture for something a human points at a live bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamGcConfig {
+    /// Never collect an object younger than this. See
+    /// [`DEFAULT_STREAM_GC_GRACE`].
+    pub grace: Duration,
+    /// Report what would be collected and delete nothing. **Defaults to
+    /// `true`.**
+    pub dry_run: bool,
+}
+
+impl Default for StreamGcConfig {
+    fn default() -> Self {
+        Self {
+            grace: DEFAULT_STREAM_GC_GRACE,
+            dry_run: true,
+        }
+    }
+}
+
+/// What a [`gc_stream`] pass found — and, when `dry_run` was false, deleted.
+///
+/// The collected keys are listed rather than counted because the primary
+/// consumer is a human reading a dry run before authorizing the real one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StreamGcOutcome {
+    /// Echo of [`StreamGcConfig::dry_run`]. `true` means nothing was deleted
+    /// and `collected_*` is a proposal.
+    pub dry_run: bool,
+    /// Every snapshot key a restore could still reach, sorted. See
+    /// [`gc_stream`]'s "Liveness" section for how this is derived.
+    pub live_base_snapshot_keys: Vec<String>,
+    /// Superseded base snapshots, sorted.
+    pub collected_snapshots: Vec<String>,
+    /// Orphaned frame objects (batch or legacy per-frame), sorted.
+    pub collected_frame_objects: Vec<String>,
+    /// Total bytes across `collected_snapshots` + `collected_frame_objects`.
+    pub collected_bytes: u64,
+    /// Snapshot objects kept — because they are live, or because the whole
+    /// snapshot half was skipped (see `base_snapshots_skipped`).
+    pub retained_snapshots: usize,
+    /// `true` when the prefix held **no generation manifests**, so this is not
+    /// provably a tier-2 sink and no base snapshot was collected.
+    ///
+    /// A `snapshots/` prefix with no chain over it is indistinguishable from a
+    /// plain tier-1a sink, whose older snapshots are *history* rather than
+    /// garbage — [`crate::snapshot::restore_latest`] takes the newest, but an
+    /// operator restoring a point in time names an older key by hand. Pruning
+    /// those is [`crate::dedup::gc_dedup`]'s `keep_n` decision to make, not
+    /// this sweep's. A live tier-2 sink always has a chain, so in the steady
+    /// state this is `false` and the superseded bases are collected; the one
+    /// way to see it `true` on a real stream is a GC that lands inside
+    /// `crate::tail::rebase`'s manifests-deleted-frames-not-yet-written window,
+    /// where skipping one pass costs nothing.
+    pub base_snapshots_skipped: bool,
+    /// Frame objects kept because a generation manifest still names them.
+    pub retained_frame_objects: usize,
+    /// Objects that were unreachable but too young to touch — the grace window
+    /// did its job. A number that never falls to zero across consecutive runs
+    /// means the grace is longer than the churn interval, not that the sweep
+    /// is broken.
+    pub spared_by_grace: usize,
+}
+
+/// Tier-2 GC: reclaim the objects a `crate::tail::rebase` orphans.
+///
+/// The tier-1b counterpart is [`crate::dedup::gc_dedup`], and this deliberately
+/// mirrors its shape: an explicitly-invoked sweep that deletes only what
+/// nothing can reach, never a step on the write or recovery path. `rebase`
+/// leaves its garbage behind on purpose — deleting data as part of a recovery
+/// path is how a recovery path becomes the outage — and this is where that
+/// debt is settled.
+///
+/// ## Two orphan classes, not one
+///
+/// R850-T3 was filed against the frames alone. The frames are the **smaller**
+/// term:
+///
+/// - **Orphaned frame objects.** Each `rebase` abandons
+///   `frames/{old_checkpoint_seq}/…` (or `frames/{epoch}/{seq}/…`) once
+///   `crate::tail::delete_generation_manifests` removes the manifests that
+///   named them. Bounded per rebase by SQLite's autocheckpoint threshold —
+///   ~1000 pages, i.e. a handful of batch objects.
+/// - **Superseded base snapshots.** `rebase` calls
+///   [`crate::snapshot::upload_base_snapshot`], which is the explicitly
+///   *non*-deduplicating one-shot variant: it `put`s a new
+///   `snapshots/snapshot-{nanos}.db` and deletes nothing. Every rebase
+///   therefore leaves a complete permanent copy of the database behind, and
+///   for any database bigger than a few megabytes that dwarfs the frames.
+///   Found while implementing this ticket; covered here rather than filed,
+///   because it is the same leak in the same function.
+///
+/// A sweep that reclaimed only the frames would leave the larger leak running.
+///
+/// ## Liveness
+///
+/// Nothing is deleted unless *no* restore path can reach it. The rule is the
+/// exact complement of what a restore selects, and the two are pinned together
+/// by `gc_liveness_is_the_complement_of_restore_selection` in this module's
+/// tests so they cannot drift:
+///
+/// - **Frames.** Live iff some generation manifest names the object, resolved
+///   through `BackupTarget::frame_objects_of` — the same function restore's
+///   replay and [`crate::puller::WalPuller`] go through, so batch and legacy
+///   per-frame layouts and both epoch key shapes are handled by construction
+///   rather than by a second copy of the layout rules here.
+/// - **Base snapshots.** Live iff *either* some generation manifest names it,
+///   *or* it is the lexically-greatest key under `snapshots/`. Those are the
+///   two selections a restore makes:
+///   [`restore_stream_from_manifests`] takes the chain's `base_snapshot_key`,
+///   and a prefix with no generations falls back to
+///   [`crate::snapshot::restore_latest`], which takes the newest key (see
+///   [`crate::hydrate`]'s `restore_subject`). Their union is kept.
+///
+/// The base rule uses *every* manifest's key rather than
+/// `validate_generation_chain`'s single answer, and that is the safe
+/// direction: a chain that spans a WAL restart does not validate at all, and a
+/// GC that refuses to guess keeps both bases instead of deleting the one the
+/// next rebase is about to adopt.
+///
+/// And when there is no chain at all, the snapshot half is skipped entirely
+/// rather than falling back to "keep the newest, collect the rest" — see
+/// [`StreamGcOutcome::base_snapshots_skipped`] for why that distinction is not
+/// paranoia. The frame half still runs: a `frames/` prefix under a sink with no
+/// generation manifests is unreachable by construction.
+///
+/// ## Grace window
+///
+/// An object younger than [`StreamGcConfig::grace`] is never collected, no
+/// matter how unreachable it looks. [`DEFAULT_STREAM_GC_GRACE`] documents the
+/// three live windows that depend on it.
+///
+/// ## Order
+///
+/// Frames first, then snapshots. Unlike [`crate::dedup::gc_dedup`] the order is
+/// not load-bearing — this sweep deletes no manifests, so nothing retained ever
+/// points at anything collected, at any point during the pass or after a crash
+/// in the middle of one.
+pub async fn gc_stream(target: &BackupTarget, cfg: &StreamGcConfig) -> Result<StreamGcOutcome> {
+    let manifests = list_and_parse_generation_manifests(target).await?;
+
+    // Normalize through ObjPath so a manifest's textual key compares equal to
+    // the same object's listed location regardless of slash padding.
+    let mut live_bases: HashSet<String> = manifests
+        .iter()
+        .map(|m| ObjPath::from(m.base_snapshot_key.as_str()).to_string())
+        .collect();
+    if let Some(newest) = crate::snapshot::latest_snapshot_key(target).await? {
+        live_bases.insert(ObjPath::from(newest).to_string());
+    }
+
+    let mut live_frames: HashSet<String> = HashSet::new();
+    for m in &manifests {
+        for (key, _first, _last) in target.frame_objects_of(m) {
+            live_frames.insert(key.to_string());
+        }
+    }
+
+    let mut out = StreamGcOutcome {
+        dry_run: cfg.dry_run,
+        base_snapshots_skipped: manifests.is_empty(),
+        ..Default::default()
+    };
+    out.live_base_snapshot_keys = live_bases.iter().cloned().collect();
+    out.live_base_snapshot_keys.sort();
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let grace_secs = i64::try_from(cfg.grace.as_secs()).unwrap_or(i64::MAX);
+    let too_young = |meta: &object_store::ObjectMeta| {
+        now_secs.saturating_sub(meta.last_modified.timestamp()) < grace_secs
+    };
+
+    for meta in list_recursive(&target.store, &join_key(&target.prefix, "frames")).await? {
+        if live_frames.contains(&meta.location.to_string()) {
+            out.retained_frame_objects += 1;
+            continue;
+        }
+        if too_young(&meta) {
+            out.spared_by_grace += 1;
+            continue;
+        }
+        if !cfg.dry_run {
+            delete_collected(target, &meta.location).await?;
+        }
+        out.collected_bytes += meta.size;
+        out.collected_frame_objects.push(meta.location.to_string());
+    }
+
+    let snapshots_prefix = join_key(&target.prefix, "snapshots");
+    let listing = target
+        .store
+        .list_with_delimiter(Some(&snapshots_prefix))
+        .await
+        .with_context(|| format!("listing base snapshots under {snapshots_prefix}"))?;
+    for meta in listing.objects {
+        // No chain over this prefix means it is not provably a tier-2 sink, and
+        // a tier-1a sink's older snapshots are history rather than garbage —
+        // see `StreamGcOutcome::base_snapshots_skipped`.
+        if out.base_snapshots_skipped || live_bases.contains(&meta.location.to_string()) {
+            out.retained_snapshots += 1;
+            continue;
+        }
+        if too_young(&meta) {
+            out.spared_by_grace += 1;
+            continue;
+        }
+        if !cfg.dry_run {
+            delete_collected(target, &meta.location).await?;
+        }
+        out.collected_bytes += meta.size;
+        out.collected_snapshots.push(meta.location.to_string());
+    }
+
+    out.collected_frame_objects.sort();
+    out.collected_snapshots.sort();
+    Ok(out)
+}
+
+/// Delete one collected object, treating "already gone" as success.
+///
+/// Two GC passes can legitimately overlap, and a retry after a partial one
+/// lands here too — in both cases the object being absent is the outcome we
+/// asked for, exactly as it is for `crate::tail::rebase`'s deletes.
+async fn delete_collected(target: &BackupTarget, key: &ObjPath) -> Result<()> {
+    match target.store.delete(key).await {
+        Ok(()) => Ok(()),
+        Err(object_store::Error::NotFound { .. }) => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e)).with_context(|| format!("collecting {key}")),
+    }
+}
+
+/// Every object at or below `root`, walked with `list_with_delimiter` rather
+/// than the streaming `list`.
+///
+/// `ObjectStore::list` returns a `BoxStream`, which needs `futures_util` to
+/// drain — and this crate deliberately keeps `futures_util` in
+/// `[dev-dependencies]` (see `Cargo.toml`), so a streaming drain here would add
+/// a real dependency to the published crate for one listing. A worklist over
+/// `list_with_delimiter` costs one request per directory instead of one per
+/// page, and the tier-2 frame tree is three levels deep at most
+/// (`frames/{epoch}/{seq}/{object}`), so that is a handful of requests.
+async fn list_recursive(
+    store: &Arc<dyn ObjectStore>,
+    root: &ObjPath,
+) -> Result<Vec<object_store::ObjectMeta>> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.clone()];
+    while let Some(dir) = pending.pop() {
+        let listing = store
+            .list_with_delimiter(Some(&dir))
+            .await
+            .with_context(|| format!("listing {dir}"))?;
+        found.extend(listing.objects);
+        pending.extend(listing.common_prefixes);
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -6149,5 +6442,336 @@ mod tests {
         assert!(parse_generation_manifest("not a manifest").is_err());
         assert!(parse_generation_manifest("TURSO-BACKUP STREAM v1\nunknown 1").is_err());
         assert!(parse_generation_manifest("TURSO-BACKUP STREAM v1\nbase_snapshot k").is_err()); // missing fields
+    }
+
+    // ---- R850-T3: tier-2 GC (gc_stream) --------------------------------
+
+    /// A tier-2 sink built object-by-object on an `InMemory` store.
+    ///
+    /// Hand-placed rather than produced by running `tail_frames`, because every
+    /// one of these tests is about a sink in a state a *live* tailer never
+    /// leaves behind — a superseded base, a generation's frames with no
+    /// manifest. Driving the writer could not produce them without also
+    /// producing the rebase that is the thing under test.
+    struct GcSink {
+        target: BackupTarget,
+    }
+
+    impl GcSink {
+        fn new() -> Self {
+            GcSink {
+                target: BackupTarget {
+                    store: Arc::new(InMemory::new()),
+                    prefix: "sink".to_string(),
+                },
+            }
+        }
+
+        /// A base snapshot at `nanos`. Body is not a real database — nothing in
+        /// the GC path parses it.
+        async fn put_snapshot(&self, nanos: u128) -> String {
+            let key = join_key(
+                &self.target.prefix,
+                &format!("snapshots/snapshot-{nanos:020}.db"),
+            );
+            self.target
+                .store
+                .put(&key, format!("base {nanos}").into_bytes().into())
+                .await
+                .unwrap();
+            key.to_string()
+        }
+
+        /// One batch object holding frames `first..=last` of generation
+        /// `(epoch, seq)`, keyed exactly as `tail_frames` would key it.
+        async fn put_frame_batch(&self, epoch: u64, seq: u32, first: u64, last: u64) -> String {
+            let key = self.target.frame_batch_key(epoch, seq, first, last);
+            self.target
+                .store
+                .put(&key, vec![0u8; 16].into())
+                .await
+                .unwrap();
+            key.to_string()
+        }
+
+        /// A generation manifest naming `base` and one batch `first..=last`.
+        async fn put_manifest(
+            &self,
+            nanos: u128,
+            base: &str,
+            epoch: u64,
+            seq: u32,
+            first: u64,
+            last: u64,
+        ) {
+            let batches = [(first, last)];
+            let text = format_generation_manifest(GenerationManifest {
+                base_snapshot_key: base,
+                page_size: 4096,
+                checkpoint_seq: seq,
+                salt: Some(WalSalt {
+                    salt1: 1,
+                    salt2: 2,
+                }),
+                first_frame: first,
+                last_frame: last,
+                epoch,
+                owner: None,
+                frame_batches: &batches,
+            });
+            self.target
+                .store
+                .put(&self.target.generation_key(nanos), text.into_bytes().into())
+                .await
+                .unwrap();
+        }
+
+        async fn exists(&self, key: &str) -> bool {
+            self.target.store.get(&ObjPath::from(key)).await.is_ok()
+        }
+    }
+
+    /// Collect everything collectable: no grace, really delete.
+    fn sweep_now() -> StreamGcConfig {
+        StreamGcConfig {
+            grace: Duration::ZERO,
+            dry_run: false,
+        }
+    }
+
+    /// (a) The base a rebase superseded is reclaimed; the one a restore would
+    /// pick is not.
+    #[tokio::test]
+    async fn gc_collects_a_superseded_base_snapshot_and_keeps_the_current_one() {
+        let sink = GcSink::new();
+        let old_base = sink.put_snapshot(1).await;
+        let new_base = sink.put_snapshot(2).await;
+        // The post-rebase steady state: the only chain names the new base.
+        sink.put_manifest(10, &new_base, 0, 5, 1, 10).await;
+        sink.put_frame_batch(0, 5, 1, 10).await;
+
+        let out = gc_stream(&sink.target, &sweep_now()).await.unwrap();
+
+        assert_eq!(out.collected_snapshots, vec![old_base.clone()]);
+        assert_eq!(out.retained_snapshots, 1);
+        assert_eq!(out.live_base_snapshot_keys, vec![new_base.clone()]);
+        assert!(!sink.exists(&old_base).await, "superseded base survived");
+        assert!(sink.exists(&new_base).await, "live base was collected");
+    }
+
+    /// The rebase-crash window: a new base is published before the old
+    /// manifests are deleted, so the surviving chain names the OLD base. Both
+    /// are live — the chain's pick and the newest — and the GC must refuse to
+    /// choose between them.
+    #[tokio::test]
+    async fn gc_keeps_both_bases_while_a_rebase_is_half_landed() {
+        let sink = GcSink::new();
+        let old_base = sink.put_snapshot(1).await;
+        let new_base = sink.put_snapshot(2).await;
+        sink.put_manifest(10, &old_base, 0, 5, 1, 10).await;
+
+        let out = gc_stream(&sink.target, &sweep_now()).await.unwrap();
+
+        assert!(out.collected_snapshots.is_empty());
+        assert_eq!(out.retained_snapshots, 2);
+        assert_eq!(out.live_base_snapshot_keys, vec![old_base, new_base]);
+    }
+
+    /// (b) An orphaned generation's frames are reclaimed — under both key
+    /// shapes — and a live generation's are not.
+    #[tokio::test]
+    async fn gc_collects_orphaned_frame_prefixes_and_keeps_the_live_generation() {
+        let sink = GcSink::new();
+        let base = sink.put_snapshot(2).await;
+        sink.put_manifest(10, &base, 0, 5, 1, 10).await;
+        let live = sink.put_frame_batch(0, 5, 1, 10).await;
+        // Generation 4 was rebased away: its manifests are gone, its frames
+        // are not. Once under the epoch-0 layout, once under the fenced one.
+        let orphan_unfenced = sink.put_frame_batch(0, 4, 1, 6).await;
+        let orphan_fenced = sink.put_frame_batch(7, 4, 1, 6).await;
+
+        let out = gc_stream(&sink.target, &sweep_now()).await.unwrap();
+
+        let mut expected = vec![orphan_unfenced.clone(), orphan_fenced.clone()];
+        expected.sort();
+        assert_eq!(out.collected_frame_objects, expected);
+        assert_eq!(out.retained_frame_objects, 1);
+        assert_eq!(out.collected_bytes, 32, "two 16-byte batch objects");
+        assert!(sink.exists(&live).await, "live generation's frames collected");
+        assert!(!sink.exists(&orphan_unfenced).await);
+        assert!(!sink.exists(&orphan_fenced).await);
+    }
+
+    /// (c) Nothing inside the grace window is touched, however unreachable it
+    /// looks. Everything an `InMemory` store holds was written moments ago, so
+    /// a non-zero grace must spare the whole sweep.
+    #[tokio::test]
+    async fn gc_spares_everything_inside_the_grace_window() {
+        let sink = GcSink::new();
+        let stale_base = sink.put_snapshot(1).await;
+        let base = sink.put_snapshot(2).await;
+        sink.put_manifest(10, &base, 0, 5, 1, 10).await;
+        sink.put_frame_batch(0, 5, 1, 10).await;
+        let orphan = sink.put_frame_batch(0, 4, 1, 6).await;
+
+        let cfg = StreamGcConfig {
+            grace: Duration::from_secs(3600),
+            dry_run: false,
+        };
+        let out = gc_stream(&sink.target, &cfg).await.unwrap();
+
+        assert!(out.collected_frame_objects.is_empty());
+        assert!(out.collected_snapshots.is_empty());
+        assert_eq!(out.collected_bytes, 0);
+        assert_eq!(out.spared_by_grace, 2, "the orphan batch and the stale base");
+        assert!(sink.exists(&orphan).await);
+        assert!(sink.exists(&stale_base).await);
+    }
+
+    /// (d) A dry run reports exactly what the real sweep would collect, and
+    /// deletes none of it.
+    #[tokio::test]
+    async fn gc_dry_run_reports_without_deleting() {
+        let sink = GcSink::new();
+        let stale_base = sink.put_snapshot(1).await;
+        let base = sink.put_snapshot(2).await;
+        sink.put_manifest(10, &base, 0, 5, 1, 10).await;
+        sink.put_frame_batch(0, 5, 1, 10).await;
+        let orphan = sink.put_frame_batch(0, 4, 1, 6).await;
+
+        let dry = gc_stream(
+            &sink.target,
+            &StreamGcConfig {
+                grace: Duration::ZERO,
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(dry.dry_run);
+        assert_eq!(dry.collected_snapshots, vec![stale_base.clone()]);
+        assert_eq!(dry.collected_frame_objects, vec![orphan.clone()]);
+        assert!(dry.collected_bytes > 0);
+        assert!(sink.exists(&stale_base).await, "dry run deleted a snapshot");
+        assert!(sink.exists(&orphan).await, "dry run deleted a frame object");
+
+        // The proposal is what the real sweep then executes, key for key.
+        let wet = gc_stream(&sink.target, &sweep_now()).await.unwrap();
+        assert!(!wet.dry_run);
+        assert_eq!(wet.collected_snapshots, dry.collected_snapshots);
+        assert_eq!(wet.collected_frame_objects, dry.collected_frame_objects);
+        assert_eq!(wet.collected_bytes, dry.collected_bytes);
+        assert!(!sink.exists(&stale_base).await);
+        assert!(!sink.exists(&orphan).await);
+    }
+
+    /// The pin `gc_stream`'s docs promise: its live set is the exact complement
+    /// of what a restore selects, on BOTH restore branches. If either selection
+    /// rule is ever changed without changing the other, this fails.
+    #[tokio::test]
+    async fn gc_liveness_is_the_complement_of_restore_selection() {
+        // Branch 1 — no generations. `hydrate::restore_subject` falls back to
+        // `snapshot::restore_latest`, which takes the lexically-greatest key.
+        // That key is live; the older ones are not collected either, because a
+        // chainless prefix is indistinguishable from a tier-1a sink whose older
+        // snapshots are history (see `base_snapshots_skipped`).
+        let sink = GcSink::new();
+        let _older = sink.put_snapshot(1).await;
+        let newest = sink.put_snapshot(2).await;
+
+        let restore_would_pick = crate::snapshot::latest_snapshot_key(&sink.target)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restore_would_pick, newest);
+
+        let out = gc_stream(
+            &sink.target,
+            &StreamGcConfig {
+                grace: Duration::ZERO,
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.live_base_snapshot_keys, vec![restore_would_pick]);
+        assert!(out.base_snapshots_skipped);
+        assert!(out.collected_snapshots.is_empty());
+        assert_eq!(out.retained_snapshots, 2);
+
+        // Branch 2 — a validating chain. `restore_stream_from_manifests` takes
+        // the chain's base, which here is the OLDER snapshot. The GC must keep
+        // it, and keep the newest as well, since the fallback branch is still
+        // reachable for any reader that finds no manifests.
+        let chained = GcSink::new();
+        let chain_base = chained.put_snapshot(1).await;
+        let unreferenced_newer = chained.put_snapshot(2).await;
+        chained.put_manifest(10, &chain_base, 0, 5, 1, 10).await;
+        chained.put_frame_batch(0, 5, 1, 10).await;
+
+        let manifests = list_and_parse_generation_manifests(&chained.target)
+            .await
+            .unwrap();
+        let chain = validate_generation_chain(&manifests).unwrap();
+        assert_eq!(chain.base_snapshot_key, chain_base);
+
+        let out = gc_stream(
+            &chained.target,
+            &StreamGcConfig {
+                grace: Duration::ZERO,
+                dry_run: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!out.base_snapshots_skipped, "a chain makes this a tier-2 sink");
+        assert!(out.live_base_snapshot_keys.contains(&chain.base_snapshot_key));
+        assert!(out.live_base_snapshot_keys.contains(&unreferenced_newer));
+        assert!(out.collected_snapshots.is_empty());
+
+        // And the retained frame set is exactly what a replay would fetch.
+        let replayed: Vec<String> = manifests
+            .iter()
+            .flat_map(|m| chained.target.frame_objects_of(m))
+            .map(|(key, _, _)| key.to_string())
+            .collect();
+        assert_eq!(out.retained_frame_objects, replayed.len());
+        assert!(out.collected_frame_objects.is_empty());
+    }
+
+    /// A prefix with no chain keeps every snapshot — its older ones could be a
+    /// tier-1a sink's history — but its `frames/` are unreachable by
+    /// construction and still go.
+    #[tokio::test]
+    async fn gc_without_a_chain_keeps_snapshots_but_still_collects_frames() {
+        let sink = GcSink::new();
+        let older = sink.put_snapshot(1).await;
+        let newest = sink.put_snapshot(2).await;
+        let orphan = sink.put_frame_batch(0, 4, 1, 6).await;
+
+        let out = gc_stream(&sink.target, &sweep_now()).await.unwrap();
+
+        assert!(out.base_snapshots_skipped);
+        assert!(out.collected_snapshots.is_empty());
+        assert_eq!(out.collected_frame_objects, vec![orphan.clone()]);
+        assert!(sink.exists(&older).await);
+        assert!(sink.exists(&newest).await);
+        assert!(!sink.exists(&orphan).await);
+    }
+
+    /// An empty prefix is a no-op, not an error — a GC pointed at a sink that
+    /// has never been written to must not fail.
+    #[tokio::test]
+    async fn gc_on_an_empty_prefix_collects_nothing() {
+        let sink = GcSink::new();
+        let out = gc_stream(&sink.target, &sweep_now()).await.unwrap();
+        assert_eq!(
+            out,
+            StreamGcOutcome {
+                base_snapshots_skipped: true,
+                ..Default::default()
+            }
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "turso-backup"
-version = "0.8.37"
+version = "0.8.40"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
@@ -82,6 +82,14 @@ path = "src/bin/hydrate.rs"
 name = "turso-backup-tail"
 path = "src/bin/tail.rs"
 
+# R850-T3 GC side: the sweep that reclaims what a rebase orphans (superseded
+# base snapshots + old-generation frame prefixes). A binary rather than a
+# library call only, because it is a thing a human points at a live bucket —
+# and it is a dry run unless GC_APPLY says otherwise. See the bin's module doc.
+[[bin]]
+name = "turso-backup-gc"
+path = "src/bin/gc.rs"
+
 # The two measurement harnesses are EXAMPLES, not bins (R761-T3). They are
 # development instruments, not shipped entry points, and examples can see
 # `[dev-dependencies]` — which is what keeps async-trait / futures-util out
@@ -132,3 +140,34 @@ path = "examples/appliance_tail_probe.rs"
 [[example]]
 name = "foreign_checkpoint_probe"
 path = "examples/foreign_checkpoint_probe.rs"
+
+# --- profiles: keep in lockstep with the yah monorepo root Cargo.toml ---
+#
+# `exclude = ["oss", "external"]` in the root makes this a genuine separate
+# workspace, so it inherits NOTHING from it — until 2026-09-12 everything here
+# built at cargo's defaults (`debug = true`, `opt-level = 0`) for the entire
+# dependency graph. Two reasons that was wrong:
+#
+#   Disk. Full DWARF on every dependency is what made `oss/yubaba/target` 16G
+#   and `oss/cheers/target` 11G, nearly all of it debuginfo nobody reads in
+#   this camp. `line-tables-only` keeps the part that IS consumed — file:line
+#   backtraces and panic locations — and drops the type/variable DWARF.
+#
+#   sccache. Its cache key includes rustc flags, so one dependency compiled at
+#   `debug = true` here and `debug = false` from the root is two entries for
+#   one crate, and every cross-workspace hit was silently lost.
+#
+# Changing these invalidates every prior artifact and sccache entry for this
+# workspace (different flags -> different hashes); that was the point. If you
+# need to single-step a dependency, override it per-package locally rather
+# than reverting the `"*"` glob.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+# W308/R745-T1: `-C incremental` makes sccache refuse a crate outright. This
+# glob applies to DEPENDENCIES and never to workspace members, so crates you
+# edit here keep incremental and crates you merely consume become cacheable.
+incremental = false

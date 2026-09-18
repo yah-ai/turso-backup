@@ -599,11 +599,22 @@ async fn stream_subject(
 ///
 /// ## What this leaves behind, deliberately
 ///
-/// The old generation's frame objects are orphaned under
-/// `frames/{old_checkpoint_seq}/`. They are keyed by sequence so they collide
-/// with nothing and are invisible to restore once their manifests are gone;
-/// reclaiming them is GC's job, not a rebase's, and deleting data as part of a
-/// recovery path is how a recovery path becomes the outage.
+/// Two things, not one — R850-T3 corrected this doc while building the sweep
+/// that reclaims them:
+///
+/// - The old generation's frame objects, orphaned under
+///   `frames/{old_checkpoint_seq}/`. They are keyed by sequence so they collide
+///   with nothing and are invisible to restore once their manifests are gone.
+/// - **The old base snapshot**, which step 1 supersedes and nothing deletes:
+///   [`snapshot::upload_base_snapshot`] is the non-deduplicating one-shot
+///   variant, so every rebase leaves a complete extra copy of the database
+///   behind. For any database past a few megabytes this is the *larger* of the
+///   two leaks, and this doc did not mention it until R850-T3.
+///
+/// Reclaiming either is GC's job, not a rebase's — deleting data as part of a
+/// recovery path is how a recovery path becomes the outage. The sweep is
+/// [`crate::stream::gc_stream`]; it is explicitly invoked, dry-run by default,
+/// and deletes only what no restore can reach.
 ///
 /// ## The fence during the gap
 ///

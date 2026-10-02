@@ -258,6 +258,9 @@ pub enum HydrateOutcome {
         /// trips. This is the number a recovery-time estimate should be
         /// replaced by once it exists.
         seconds: f64,
+        /// The volume was populated but stale, and was moved aside before the
+        /// restore. See [`Displaced`].
+        displaced: Option<Displaced>,
     },
     /// The volume already holds every subject. Nothing was read and **no claim
     /// was taken** — an ordinary restart must not mint an epoch, because doing
@@ -271,6 +274,23 @@ pub enum HydrateOutcome {
     NothingInTheStore { epoch: u64, subjects: Vec<String> },
     /// Do not start the workload.
     Refused(HydrateRefusal),
+}
+
+/// A populated volume that was moved aside because the store's claim names a
+/// different owner (R936-B2).
+///
+/// The claim is written by whoever last streamed this workload's state, so a
+/// claim held by someone else means that someone wrote after this volume's
+/// copy. Serving the local copy would hand out a stale history. On 2026-09-22
+/// that was a Sep-6 headscale.db with a different address plan, served as the
+/// mesh coordinator's database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Displaced {
+    /// The claim holder the local copy lost to.
+    pub owner: String,
+    pub epoch: u64,
+    /// Suffix appended to every moved file (`<file>.<suffix>`).
+    pub suffix: String,
 }
 
 /// Every way a hydrate says "do not start this workload".
@@ -301,6 +321,11 @@ pub enum HydrateRefusal {
     /// rather than a caller's responsibility because a caller who forgets gets
     /// a fence that isn't there and no way to tell.
     SinkNotFenced { stage: PreflightStage },
+    /// The volume was stale (the claim names `owner`), but the store held
+    /// nothing to restore. The local files were put back and nothing starts:
+    /// a stale history and an empty one are both wrong, and choosing between
+    /// them is an operator's call.
+    StaleVolumeNothingToRestore { owner: String, epoch: u64 },
 }
 
 impl HydrateRefusal {
@@ -333,6 +358,11 @@ impl HydrateRefusal {
                  state. Check that the bucket supports conditional writes (R2 and MinIO do; \
                  some S3-compatible backends do not)",
                 stage.as_str()
+            ),
+            HydrateRefusal::StaleVolumeNothingToRestore { owner, epoch } => format!(
+                "this volume's copy is stale (the claim is held by {owner} at epoch {epoch}), \
+                 but the store holds nothing to restore. The local files were left in place; \
+                 decide by hand whether they or an empty start is authoritative"
             ),
         }
     }
@@ -389,8 +419,21 @@ impl HydrateRequest<'_> {
 /// indistinguishable from the partition the fence exists for.
 pub async fn hydrate(req: HydrateRequest<'_>) -> Result<HydrateOutcome> {
     let states = inspect_volume(req.volume_root, req.subjects)?;
+    let mut displaced = None;
     match assess(&states)? {
-        Readiness::AlreadyPopulated => return Ok(HydrateOutcome::AlreadyPopulated),
+        // R936-B2: "populated" is not "current". The one node whose local copy
+        // is known current is the node that last held the claim, because the
+        // claim holder is the only writer. Any other populated volume is a
+        // leftover from an earlier ownership and must not serve. Reading the
+        // claim is a single GET and takes no epoch, so an ordinary restart of
+        // the holder still mints nothing. An unreachable store is an `Err`
+        // (do not start), the same posture as every other store failure here.
+        Readiness::AlreadyPopulated => match claim::read_claim(&req.workload_target()).await? {
+            Some(held) if held.owner != req.owner && owner_names_a_node(&held.owner) => {
+                displaced = Some(displace_volume(req.volume_root, req.subjects, &held)?);
+            }
+            _ => return Ok(HydrateOutcome::AlreadyPopulated),
+        },
         Readiness::TornVolume { populated, absent } => {
             return Ok(HydrateOutcome::Refused(HydrateRefusal::TornVolume {
                 populated,
@@ -425,6 +468,70 @@ pub async fn hydrate(req: HydrateRequest<'_>) -> Result<HydrateOutcome> {
 
     let mut restored = Vec::new();
     let mut missing = Vec::new();
+    // R936-B2, measured on prod 2026-09-23 00:02:04Z: a restore that errors
+    // AFTER the claim is taken must not leave its bytes behind. The claim now
+    // names this node, so the next attempt reads the populated volume as the
+    // holder's own copy and serves it. That is exactly how us-south-001 served a
+    // base with none of its frames applied. Clearing the subjects sends the
+    // next attempt back through a full restore. The displaced copy stays aside:
+    // putting it back would serve it under this node's claim, which is worse.
+    if let Err(e) = restore_all(&req, &mut restored, &mut missing).await {
+        clear_subjects(req.volume_root, req.subjects);
+        return Err(e.context(
+            "restore failed after the claim was taken; the partial restore was removed \
+             so the next attempt restores again instead of trusting it",
+        ));
+    }
+
+    // A prefix that holds some subjects and not others is the store-side twin
+    // of `TornVolume`, and it is refused for the identical reason: restoring
+    // the ones that exist would start the workload with a partial history it
+    // cannot tell apart from a complete one.
+    if !missing.is_empty() && !restored.is_empty() {
+        return Ok(HydrateOutcome::Refused(HydrateRefusal::TornVolume {
+            populated: restored.into_iter().map(|r| r.subject).collect(),
+            absent: missing,
+        }));
+    }
+
+    // Step 3: the claim must still be ours, checked *after* the bytes landed.
+    if let Err(lost) = claim::assert_holds(&workload_target, epoch).await? {
+        return Ok(HydrateOutcome::Refused(HydrateRefusal::FencedMidRestore {
+            lost,
+            restored,
+        }));
+    }
+
+    if restored.is_empty() {
+        if let Some(d) = displaced {
+            undisplace_volume(req.volume_root, req.subjects, &d.suffix)?;
+            return Ok(HydrateOutcome::Refused(
+                HydrateRefusal::StaleVolumeNothingToRestore {
+                    owner: d.owner,
+                    epoch: d.epoch,
+                },
+            ));
+        }
+        return Ok(HydrateOutcome::NothingInTheStore {
+            epoch,
+            subjects: missing,
+        });
+    }
+    Ok(HydrateOutcome::Hydrated {
+        epoch,
+        subjects: restored,
+        seconds: started.elapsed().as_secs_f64(),
+        displaced,
+    })
+}
+
+/// Restore every subject into the volume, recording each one in `restored`, or
+/// in `missing` if the store has nothing for it.
+async fn restore_all(
+    req: &HydrateRequest<'_>,
+    restored: &mut Vec<SubjectRestore>,
+    missing: &mut Vec<String>,
+) -> Result<()> {
     for subject in req.subjects {
         let dest = subject_path(req.volume_root, subject)?;
         // A subject in a subdirectory of the volume needs that subdirectory to
@@ -457,37 +564,88 @@ pub async fn hydrate(req: HydrateRequest<'_>) -> Result<HydrateOutcome> {
             frames_replayed,
         });
     }
+    Ok(())
+}
 
-    // A prefix that holds some subjects and not others is the store-side twin
-    // of `TornVolume`, and it is refused for the identical reason: restoring
-    // the ones that exist would start the workload with a partial history it
-    // cannot tell apart from a complete one.
-    if !missing.is_empty() && !restored.is_empty() {
-        return Ok(HydrateOutcome::Refused(HydrateRefusal::TornVolume {
-            populated: restored.into_iter().map(|r| r.subject).collect(),
-            absent: missing,
-        }));
+/// Remove every subject and its sidecars from the volume. Best-effort: a file
+/// that is already gone is the state we want.
+fn clear_subjects(volume_root: &Path, subjects: &[String]) {
+    for subject in subjects {
+        let Ok(path) = subject_path(volume_root, subject) else {
+            continue;
+        };
+        for sfx in SIDECARS {
+            let mut p = path.clone().into_os_string();
+            p.push(sfx);
+            let _ = std::fs::remove_file(&p);
+        }
     }
+}
 
-    // Step 3: the claim must still be ours, checked *after* the bytes landed.
-    if let Err(lost) = claim::assert_holds(&workload_target, epoch).await? {
-        return Ok(HydrateOutcome::Refused(HydrateRefusal::FencedMidRestore {
-            lost,
-            restored,
-        }));
-    }
+/// Whether a claim's owner label identifies a NODE, which is the only thing that
+/// lets a mismatch prove "someone else streamed after this volume was written".
+///
+/// R936-B2 follow-on, measured on prod 2026-09-22 23:49:52Z: every claim minted
+/// before kamaji's owner label became the hostname carries `kamaji-pid-<pid>`,
+/// a PROCESS. Such a label differs from this node's hostname label even when
+/// this very node minted it, so treating it as foreign displaced
+/// noisetable-account's own (possibly newer) volume on its next redeploy. A
+/// process label cannot prove a different owner, so it proves nothing: keep
+/// the volume. The tail then re-mints the claim under the node label at its
+/// next epoch, so each workload leaves this branch after one start. Removal is
+/// tracked as an R936-B2 cleanup.
+fn owner_names_a_node(owner: &str) -> bool {
+    !owner.starts_with("kamaji-pid-")
+}
 
-    if restored.is_empty() {
-        return Ok(HydrateOutcome::NothingInTheStore {
-            epoch,
-            subjects: missing,
-        });
+/// SQLite sidecars that belong to a subject file. Moved with it, or a restored
+/// main file would be opened against the stale copy's WAL.
+const SIDECARS: [&str; 4] = ["", "-wal", "-shm", "-journal"];
+
+/// Move every populated subject (and its sidecars) to `<file>.<suffix>`.
+fn displace_volume(
+    volume_root: &Path,
+    subjects: &[String],
+    held: &claim::ClaimRecord,
+) -> Result<Displaced> {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let suffix = format!("displaced-{unix}");
+    for subject in subjects {
+        let base = subject_path(volume_root, subject)?;
+        for side in SIDECARS {
+            let from = PathBuf::from(format!("{}{side}", base.display()));
+            if from.exists() {
+                let to = PathBuf::from(format!("{}{side}.{suffix}", base.display()));
+                std::fs::rename(&from, &to).with_context(|| {
+                    format!("displacing stale {} to {}", from.display(), to.display())
+                })?;
+            }
+        }
     }
-    Ok(HydrateOutcome::Hydrated {
-        epoch,
-        subjects: restored,
-        seconds: started.elapsed().as_secs_f64(),
+    Ok(Displaced {
+        owner: held.owner.clone(),
+        epoch: held.epoch,
+        suffix,
     })
+}
+
+/// Undo [`displace_volume`].
+fn undisplace_volume(volume_root: &Path, subjects: &[String], suffix: &str) -> Result<()> {
+    for subject in subjects {
+        let base = subject_path(volume_root, subject)?;
+        for side in SIDECARS {
+            let from = PathBuf::from(format!("{}{side}.{suffix}", base.display()));
+            if from.exists() {
+                let to = PathBuf::from(format!("{}{side}", base.display()));
+                std::fs::rename(&from, &to)
+                    .with_context(|| format!("restoring displaced {}", from.display()))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Restore one subject, or `Ok(None)` when the store holds nothing for it.
@@ -760,6 +918,129 @@ mod tests {
             None,
             "a restart must not mint an epoch"
         );
+    }
+
+    /// R936-B2, the 2026-09-22 failover: a node holding a leftover copy is
+    /// elected while another node holds the claim. The leftover must be moved
+    /// aside and the store's copy restored, not served.
+    #[tokio::test]
+    async fn a_populated_volume_whose_claim_is_held_elsewhere_is_displaced_and_restored() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        seed_snapshot(&store, "wl/acct/accounts.db", b"CURRENT").await;
+        let target = BackupTarget {
+            store: store.clone(),
+            prefix: "wl/acct".into(),
+        };
+        let ClaimOutcome::Granted { claim: prior, .. } =
+            claim::acquire(&target, "us-south-001").await.unwrap()
+        else {
+            panic!("seeding the claim");
+        };
+        let dir = tempdir("stale");
+        std::fs::write(dir.join("accounts.db"), b"STALE-SEP-6").unwrap();
+        std::fs::write(dir.join("accounts.db-wal"), b"STALE-WAL").unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+
+        let out = hydrate(request(&store, &dir, &subjects, "us-west-001"))
+            .await
+            .unwrap();
+        let HydrateOutcome::Hydrated { epoch, displaced: Some(d), .. } = out else {
+            panic!("expected Hydrated with a displacement, got {out:?}");
+        };
+        assert!(epoch > prior.epoch);
+        assert_eq!(d.owner, "us-south-001");
+        assert_eq!(std::fs::read(dir.join("accounts.db")).unwrap(), db_image(b"CURRENT"));
+        assert!(!dir.join("accounts.db-wal").exists(), "the stale WAL must not survive");
+        assert_eq!(
+            std::fs::read(dir.join(format!("accounts.db.{}", d.suffix))).unwrap(),
+            b"STALE-SEP-6"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(format!("accounts.db-wal.{}", d.suffix))).unwrap(),
+            b"STALE-WAL"
+        );
+        let held = claim::read_claim(&target).await.unwrap().unwrap();
+        assert_eq!(held.owner, "us-west-001");
+    }
+
+    /// The holder restarting keeps its volume and mints nothing.
+    #[tokio::test]
+    async fn the_claim_holder_restarting_keeps_its_volume() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        seed_snapshot(&store, "wl/acct/accounts.db", b"OLD-BACKUP").await;
+        let target = BackupTarget {
+            store: store.clone(),
+            prefix: "wl/acct".into(),
+        };
+        claim::acquire(&target, "us-west-001").await.unwrap();
+        let before = claim::read_claim(&target).await.unwrap().unwrap();
+        let dir = tempdir("holder");
+        std::fs::write(dir.join("accounts.db"), b"LIVE").unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+
+        let out = hydrate(request(&store, &dir, &subjects, "us-west-001"))
+            .await
+            .unwrap();
+        assert_eq!(out, HydrateOutcome::AlreadyPopulated);
+        assert_eq!(std::fs::read(dir.join("accounts.db")).unwrap(), b"LIVE");
+        assert_eq!(claim::read_claim(&target).await.unwrap().unwrap(), before);
+    }
+
+    /// A legacy process-scoped claim (`kamaji-pid-<pid>`) cannot prove another
+    /// node streamed after this volume: the node that minted it may be this
+    /// one. Keep the volume, restore nothing; the tail re-mints under the node
+    /// label. Prod 2026-09-22: noisetable-account was displaced by exactly this.
+    #[tokio::test]
+    async fn a_legacy_process_label_claim_keeps_the_volume() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        seed_snapshot(&store, "wl/acct/accounts.db", b"OLDER-BACKUP").await;
+        let target = BackupTarget {
+            store: store.clone(),
+            prefix: "wl/acct".into(),
+        };
+        claim::acquire(&target, "kamaji-pid-794566").await.unwrap();
+        let before = claim::read_claim(&target).await.unwrap().unwrap();
+        let dir = tempdir("legacy-label");
+        std::fs::write(dir.join("accounts.db"), b"NEWER-LOCAL").unwrap();
+        std::fs::write(dir.join("accounts.db-wal"), b"LOCAL-WAL").unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+
+        let out = hydrate(request(&store, &dir, &subjects, "vps-8dba9ff8"))
+            .await
+            .unwrap();
+        assert_eq!(out, HydrateOutcome::AlreadyPopulated);
+        assert_eq!(std::fs::read(dir.join("accounts.db")).unwrap(), b"NEWER-LOCAL");
+        assert_eq!(std::fs::read(dir.join("accounts.db-wal")).unwrap(), b"LOCAL-WAL");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "nothing displaced");
+        assert_eq!(claim::read_claim(&target).await.unwrap().unwrap(), before);
+    }
+
+    /// Stale, but nothing to restore: put the files back and refuse.
+    #[tokio::test]
+    async fn a_stale_volume_with_an_empty_store_is_put_back_and_refused() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let target = BackupTarget {
+            store: store.clone(),
+            prefix: "wl/acct".into(),
+        };
+        claim::acquire(&target, "us-south-001").await.unwrap();
+        let dir = tempdir("stale-empty");
+        std::fs::write(dir.join("accounts.db"), b"STALE").unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+
+        let out = hydrate(request(&store, &dir, &subjects, "us-west-001"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out,
+                HydrateOutcome::Refused(HydrateRefusal::StaleVolumeNothingToRestore { .. })
+            ),
+            "{out:?}"
+        );
+        assert_eq!(std::fs::read(dir.join("accounts.db")).unwrap(), b"STALE");
+        let leftovers = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(leftovers, 1, "no displaced copy may be left behind");
     }
 
     #[tokio::test]
@@ -1036,6 +1317,137 @@ mod tests {
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    /// Fails every GET whose key contains `poison` — a restore that dies after
+    /// the claim is taken and after earlier subjects have landed.
+    struct FailingGetStore {
+        inner: Arc<dyn ObjectStore>,
+        poison: &'static str,
+    }
+
+    impl std::fmt::Display for FailingGetStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingGetStore({})", self.inner)
+        }
+    }
+    impl std::fmt::Debug for FailingGetStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "FailingGetStore({:?})", self.inner)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for FailingGetStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            if location.as_ref().contains(self.poison) {
+                return Err(object_store::Error::Generic {
+                    store: "FailingGetStore",
+                    source: "injected mid-restore failure".into(),
+                });
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: futures_util::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// R936-B2, prod 2026-09-23: a restore that errors after the claim is taken
+    /// must leave the volume EMPTY. Otherwise the next attempt sees a populated
+    /// volume under this node's own claim and serves the partial restore.
+    #[tokio::test]
+    async fn a_restore_that_fails_after_the_claim_leaves_nothing_to_trust() {
+        let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        seed_snapshot(&inner, "wl/acct/a.db", b"A-CURRENT").await;
+        seed_snapshot(&inner, "wl/acct/b.db", b"B-CURRENT").await;
+        let failing: Arc<dyn ObjectStore> = Arc::new(FailingGetStore {
+            inner: inner.clone(),
+            poison: "b.db/snapshots/",
+        });
+        let dir = tempdir("fail-mid-restore");
+        let subjects = vec!["a.db".to_string(), "b.db".to_string()];
+
+        let err = hydrate(request(&failing, &dir, &subjects, "us-south-001"))
+            .await
+            .expect_err("the injected GET failure must surface");
+        assert!(format!("{err:#}").contains("partial restore was removed"), "{err:#}");
+        assert!(!dir.join("a.db").exists(), "a.db landed before the failure and must be cleared");
+        assert!(!dir.join("b.db").exists());
+        let held = claim::read_claim(&BackupTarget {
+            store: inner.clone(),
+            prefix: "wl/acct".into(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(held.owner, "us-south-001", "the claim was taken before the failure");
+
+        // The retry restores both subjects from the store instead of trusting
+        // anything left behind.
+        let out = hydrate(request(&inner, &dir, &subjects, "us-south-001"))
+            .await
+            .unwrap();
+        let HydrateOutcome::Hydrated { epoch, subjects: restored, .. } = out else {
+            panic!("expected a full restore on retry, got {out:?}");
+        };
+        assert!(epoch > held.epoch);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(std::fs::read(dir.join("a.db")).unwrap(), db_image(b"A-CURRENT"));
+        assert_eq!(std::fs::read(dir.join("b.db")).unwrap(), db_image(b"B-CURRENT"));
     }
 
     struct RacingStore {

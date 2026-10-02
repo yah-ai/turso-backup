@@ -616,11 +616,27 @@ impl CoreWalSeam {
     /// probes D and G). That is correct for the restore/apply direction, which
     /// owns the destination file outright, and wrong for reading a live source:
     /// use [`Self::open_reader`] there.
+    ///
+    /// R936-B2, measured on prod 2026-09-23: `with_autovacuum(true)` is not
+    /// optional. turso_core 0.7.2 (`lib.rs` header validation) silently
+    /// DOWNGRADES a writable open to `ReadOnly` when the header says
+    /// auto_vacuum is on and that opt is unset. A read-only open with no
+    /// `-wal` file gets a no-op WAL, so every `wal_insert_frame` fails with
+    /// "called on database without WAL". headscale runs
+    /// `auto_vacuum=INCREMENTAL`, so every stream restore of the coordinator
+    /// DB failed after laying down the base. This seam only moves raw frames
+    /// and never runs a vacuum, so enabling it changes nothing else.
     pub fn open(path: &str) -> Result<Self> {
         let io: Arc<dyn turso_core::IO> =
             Arc::new(turso_core::PlatformIO::new().context("creating turso_core PlatformIO")?);
-        let db = turso_core::Database::open_file(io, path)
-            .with_context(|| format!("opening turso_core db {path}"))?;
+        let db = turso_core::Database::open_file_with_flags(
+            io,
+            path,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new().with_autovacuum(true),
+            None,
+        )
+        .with_context(|| format!("opening turso_core db {path}"))?;
         let conn = db.connect().context("connecting to turso_core db")?;
         // Take WAL ownership — same first move sync_server.rs makes.
         conn.wal_auto_actions_disable();
@@ -5451,6 +5467,36 @@ mod tests {
         let writable = CoreWalSeam::open(src.path()).unwrap().wal_state().unwrap();
         let reader = CoreWalSeam::open_reader(src.path()).unwrap().wal_state().unwrap();
         assert_eq!(writable, reader);
+    }
+
+    /// R936-B2, the prod headscale failover: a base written by upstream SQLite
+    /// with `auto_vacuum=INCREMENTAL` (what headscale runs) must open WRITABLE
+    /// with a real WAL, so frames replay onto it. Before the fix turso_core
+    /// silently downgraded the open to read-only and frame 1 failed with
+    /// "wal_insert_frame() called on database without WAL". The fixture is
+    /// real SQLite output: base = one row, checkpointed; frames = one commit
+    /// adding a second row.
+    #[tokio::test]
+    async fn an_autovacuum_base_accepts_replayed_frames() {
+        let base = include_bytes!("../tests/fixtures/r936b2-autovacuum-base.db");
+        let frames = include_bytes!("../tests/fixtures/r936b2-autovacuum-frames.bin");
+        assert!(base[64..68] != [0, 0, 0, 0], "fixture must be incremental-vacuum");
+        let dest = TempDb::new("r936b2-autovacuum");
+        std::fs::write(dest.path(), base).unwrap();
+
+        let seam = CoreWalSeam::open(dest.path()).unwrap();
+        seam.wal_insert_begin().unwrap();
+        for (i, f) in frames.chunks(24 + 4096).enumerate() {
+            seam.wal_insert_frame(i as u64 + 1, f).unwrap();
+        }
+        seam.wal_insert_end(false).unwrap();
+        assert_eq!(seam.wal_state().unwrap().last_frame, 1);
+        drop(seam);
+
+        let db = turso::Builder::new_local(dest.path()).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut r = conn.query("SELECT COUNT(*) FROM nodes", ()).await.unwrap();
+        assert_eq!(r.next().await.unwrap().unwrap().get::<i64>(0).unwrap(), 2);
     }
 
     /// A second call to `raw_consistent_copy_live` after more writes captures

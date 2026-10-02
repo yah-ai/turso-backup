@@ -182,11 +182,21 @@ fn outcome_to_json(outcome: &HydrateOutcome) -> String {
             epoch,
             subjects,
             seconds,
+            displaced,
         } => {
             let bytes: u64 = subjects.iter().map(|s| s.bytes).sum();
+            let displaced = match displaced {
+                Some(d) => format!(
+                    "{{\"owner\":{},\"epoch\":{},\"suffix\":{}}}",
+                    json_string(&d.owner),
+                    d.epoch,
+                    json_string(&d.suffix)
+                ),
+                None => "null".to_string(),
+            };
             format!(
                 "{{\"outcome\":\"hydrated\",\"epoch\":{epoch},\"subjects\":{},\"bytes\":{bytes},\
-                 \"seconds\":{seconds:.3},\"restored\":[{}]}}",
+                 \"seconds\":{seconds:.3},\"displaced\":{displaced},\"restored\":[{}]}}",
                 subjects.len(),
                 subjects
                     .iter()
@@ -227,6 +237,7 @@ fn refusal_kind(refusal: &turso_backup::hydrate::HydrateRefusal) -> &'static str
         R::ClaimLost { .. } => "claim_lost",
         R::FencedMidRestore { .. } => "fenced_mid_restore",
         R::SinkNotFenced { .. } => "sink_not_fenced",
+        R::StaleVolumeNothingToRestore { .. } => "stale_volume_nothing_to_restore",
     }
 }
 
@@ -281,6 +292,7 @@ mod tests {
         let line = outcome_to_json(&HydrateOutcome::Hydrated {
             epoch: 4,
             seconds: 12.5,
+            displaced: None,
             subjects: vec![SubjectRestore {
                 subject: "accounts.db".into(),
                 source: "wl/acct/accounts.db/snapshots/snapshot-000.db".into(),
@@ -307,7 +319,7 @@ mod tests {
             line,
             concat!(
                 r#"{"outcome":"hydrated","epoch":4,"subjects":1,"bytes":1024,"seconds":12.500,"#,
-                r#""restored":[{"subject":"accounts.db","#,
+                r#""displaced":null,"restored":[{"subject":"accounts.db","#,
                 r#""source":"wl/acct/accounts.db/snapshots/snapshot-000.db","#,
                 r#""bytes":1024,"seconds":12.250}]}"#,
             )

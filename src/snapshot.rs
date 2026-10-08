@@ -143,10 +143,15 @@ pub async fn snapshot_and_upload(db_path: &str, target: &BackupTarget) -> Result
     }
 
     // Source moved -> take the canonical snapshot. SQLite refuses an existing
-    // VACUUM INTO target, so the nanosecond + pid name is unique and removed first.
+    // VACUUM INTO target, so the name is unique and removed first. The clock
+    // alone is not unique (macOS ticks in microseconds, so two concurrent
+    // snapshots in one process collide and delete each other's output), hence
+    // the process-wide sequence.
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = unix_nanos();
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp_path = std::env::temp_dir().join(format!(
-        "turso-snapshot-{}-{nanos}.db",
+        "turso-snapshot-{}-{nanos}-{seq}.db",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&temp_path);

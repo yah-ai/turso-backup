@@ -1,6 +1,6 @@
 [package]
 name = "turso-backup"
-version = "0.8.42"
+version = "0.8.43"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
@@ -16,7 +16,12 @@ categories = ["database"]
 
 [dependencies]
 # Bumped 0.6.1 -> 0.7.2 in R830 (0.6.1 loses writes behind a live Rows).
-turso = "0.7.2"
+# default-features = false (R960-F7): turso's default `mimalloc` feature installs a
+# `#[global_allocator]`, and a binary that sets its own (yah does) then fails to
+# link with "conflicts with global allocator in: turso" once it depends on this
+# crate. A library must not choose the allocator. `fts` is kept (the default's
+# other half), matching the root workspace pin.
+turso = { version = "0.7.2", default-features = false, features = ["fts"] }
 # Tier 2 raw WAL seam (wal_state / wal_get_frame / wal_auto_actions_disable /
 # wal_insert_*) lives on turso_core::Connection behind feature='conn_raw_api'.
 # The friendly `turso` wrapper does NOT re-export it (R005-T1 finding), so we
@@ -28,7 +33,12 @@ turso_core = { version = "0.7.2", features = ["conn_raw_api"] }
 # backend-agnostic (Arc<dyn ObjectStore>); pulling `aws` in here just lets
 # the in-crate bin construct the most common backend without consumers
 # repeating the dep + features. R006-F2.
-object_store = { version = "0.13", features = ["aws"] }
+# 0.14, not 0.13 (R903-T1): 0.13's reqwest dep hard-wired
+# `rustls-tls-native-roots`, which cargo feature-unified onto every reqwest
+# 0.12 user downstream — so yubaba's plain-http raft transport walked the macOS
+# trust store on every client build (R903). 0.14 moved to reqwest 0.13 and
+# leaves root selection to the consumer.
+object_store = { version = "0.14", features = ["aws"] }
 anyhow = "1"
 # "time" added for R574-F2: the R2-backpressure retry loop (stream.rs /
 # backpressure.rs) needs tokio::time::sleep for 429/503 backoff.

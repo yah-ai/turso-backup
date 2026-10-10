@@ -3313,7 +3313,7 @@ dependencies = [
 
 [[package]]
 name = "turso-backup"
-version = "0.8.43"
+version = "0.8.45"
 dependencies = [
  "anyhow",
  "async-trait",

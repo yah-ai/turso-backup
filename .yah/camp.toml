@@ -1,4 +1,5 @@
 #:schema ../../../.yah/schema/camp.toml.schema.json
+env = "native"
 
 # turso-backup is a sibling open-source-bound crate that yah depends on via
 # path dep from external/db_test (and eventually yah-desktop). This .yah/ is

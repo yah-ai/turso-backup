@@ -55,18 +55,17 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::stream::validated_against_source;
+use store_claim::{join_key, BackupTarget};
 
-/// Configuration for an object-store backup target (S3 / R2 / MinIO, path-style).
-///
-/// Wraps a generic `object_store::ObjectStore` so the caller picks the backend
-/// (e.g., `AmazonS3Builder::new().with_endpoint("http://minio:9000").build()`),
-/// then hands this crate a `BackupTarget` to use for snapshot operations.
-pub struct BackupTarget {
-    pub store: Arc<dyn ObjectStore>,
-    pub prefix: String,
+/// Key layout for the snapshot path. `BackupTarget` lives in `store-claim`, so
+/// these are an extension trait rather than inherent methods.
+trait SnapshotKeys {
+    fn snapshot_key(&self, unix_nanos: u128) -> ObjPath;
+    fn source_fingerprint_key(&self) -> ObjPath;
+    fn snapshot_fingerprint_key(&self) -> ObjPath;
 }
 
-impl BackupTarget {
+impl SnapshotKeys for BackupTarget {
     /// Object key for a snapshot taken at `unix_nanos` (zero-padded so lexical
     /// order matches chronological order — restore can pick the newest by name
     /// or by last-modified).
@@ -344,7 +343,7 @@ async fn put_text(store: &Arc<dyn ObjectStore>, key: &ObjPath, text: &str) -> Re
 /// The destination is removed at the start of every attempt, because SQLite
 /// refuses to `VACUUM INTO` a file that already exists and a retried attempt
 /// would otherwise fail on its predecessor's output.
-async fn vacuum_into(db_path: &str, temp_path: &std::path::Path) -> Result<()> {
+pub(crate) async fn vacuum_into(db_path: &str, temp_path: &std::path::Path) -> Result<()> {
     // Single-quote the path SQLite-style (double any embedded quote).
     let escaped = temp_path.to_string_lossy().replace('\'', "''");
     validated_against_source(db_path, "VACUUM INTO snapshot", || async {
@@ -355,7 +354,7 @@ async fn vacuum_into(db_path: &str, temp_path: &std::path::Path) -> Result<()> {
             io,
             db_path,
             turso_core::OpenFlags::ReadOnly,
-            turso_core::DatabaseOpts::new(),
+            crate::stream::reader_opts(db_path),
             None,
         )
         .with_context(|| format!("opening turso db {db_path} read-only"))?;
@@ -365,17 +364,6 @@ async fn vacuum_into(db_path: &str, temp_path: &std::path::Path) -> Result<()> {
         Ok(())
     })
     .await
-}
-
-/// Join an object-store prefix and a leaf into a normalized [`ObjPath`],
-/// tolerating empty/slash-padded prefixes.
-fn join_key(prefix: &str, leaf: &str) -> ObjPath {
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
-        ObjPath::from(leaf)
-    } else {
-        ObjPath::from(format!("{prefix}/{leaf}"))
-    }
 }
 
 fn unix_nanos() -> u128 {

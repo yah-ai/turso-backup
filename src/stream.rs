@@ -197,7 +197,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::backpressure::{put_with_backoff, BackpressureConfig, BackpressurePolicy, BackpressureReport};
-use crate::snapshot::BackupTarget;
+use store_claim::{join_key, BackupTarget};
 
 /// WAL frame layout: 24-byte frame header (page_no big-endian at 0..4,
 /// db_size big-endian at 4..8, salts/checksums in the remainder) followed by
@@ -600,6 +600,21 @@ impl FrameInfo {
     }
 }
 
+/// Options for a read-only open of a live database: the writer's WAL mode.
+///
+/// A database opened with turso's experimental multiprocess WAL (yah's camp
+/// enrollment ledger, R726) refuses a legacy reader outright ("Database is
+/// already open with experimental multiprocess WAL in another process"), so
+/// the camp-host tail could never back it up (R975-F26). Its writer keeps a
+/// `<db>-tshm` coordination file beside the WAL (turso_core's crate-private
+/// `coordination_path_for_wal_path`). Opting in only when that file exists
+/// keeps a legacy database on a filesystem without shared-WAL support
+/// opening exactly as before.
+pub(crate) fn reader_opts(db_path: &str) -> turso_core::DatabaseOpts {
+    let multiprocess = std::path::Path::new(&format!("{db_path}-tshm")).exists();
+    turso_core::DatabaseOpts::new().with_multiprocess_wal(multiprocess)
+}
+
 /// Real WAL seam backed by a live `turso_core::Connection`.
 pub struct CoreWalSeam {
     conn: Arc<turso_core::Connection>,
@@ -644,7 +659,8 @@ impl CoreWalSeam {
     }
 
     /// R858-B18 — open a **read-only** connection at `path`, taking **no**
-    /// whole-file lock. This is the constructor the backup direction wants: a
+    /// whole-file lock, in the writer's WAL mode ([`reader_opts`]). This is
+    /// the constructor the backup direction wants: a
     /// backup is a reader, and it must not lock out the application whose
     /// database it is reading.
     ///
@@ -680,7 +696,7 @@ impl CoreWalSeam {
             io,
             path,
             turso_core::OpenFlags::ReadOnly,
-            turso_core::DatabaseOpts::new(),
+            reader_opts(path),
             None,
         )
         .with_context(|| format!("opening turso_core db {path} read-only"))?;
@@ -1090,8 +1106,18 @@ pub struct RpoStatus {
     pub breached: bool,
 }
 
-impl BackupTarget {
-    pub(crate) fn watermark_key(&self) -> ObjPath {
+/// Key layout for the stream path. `BackupTarget` lives in `store-claim`, so
+/// these are an extension trait rather than inherent methods.
+pub(crate) trait StreamKeys {
+    fn watermark_key(&self) -> ObjPath;
+    fn frame_key(&self, epoch: u64, checkpoint_seq: u32, frame_no: u64) -> ObjPath;
+    fn frame_batch_key(&self, epoch: u64, checkpoint_seq: u32, first: u64, last: u64) -> ObjPath;
+    fn frame_objects_of(&self, m: &OwnedGenerationManifest) -> Vec<(ObjPath, u64, u64)>;
+    fn generation_key(&self, unix_nanos: u128) -> ObjPath;
+}
+
+impl StreamKeys for BackupTarget {
+    fn watermark_key(&self) -> ObjPath {
         join_key(&self.prefix, "latest.stream-watermark")
     }
 
@@ -1108,7 +1134,7 @@ impl BackupTarget {
     ///
     /// R761-F2: this is the *read-side legacy* key shape now — nothing writes
     /// one-object-per-frame any more. See [`Self::frame_batch_key`].
-    pub(crate) fn frame_key(&self, epoch: u64, checkpoint_seq: u32, frame_no: u64) -> ObjPath {
+    fn frame_key(&self, epoch: u64, checkpoint_seq: u32, frame_no: u64) -> ObjPath {
         let suffix = if epoch == 0 {
             format!("frames/{checkpoint_seq:010}/{frame_no:020}")
         } else {
@@ -1131,7 +1157,7 @@ impl BackupTarget {
     /// Distinguishable from a legacy per-frame key by construction (that one
     /// has no `-`), so a stream that straddles the layout change can hold both
     /// shapes under the same directory without collision.
-    pub(crate) fn frame_batch_key(
+    fn frame_batch_key(
         &self,
         epoch: u64,
         checkpoint_seq: u32,
@@ -1154,7 +1180,7 @@ impl BackupTarget {
     /// pre-R761-F2 one-object-per-frame layout when it does not. Restore's
     /// replay and [`crate::puller::WalPuller`] both go through here, so the
     /// two can never drift apart about where a frame lives.
-    pub(crate) fn frame_objects_of(
+    fn frame_objects_of(
         &self,
         m: &OwnedGenerationManifest,
     ) -> Vec<(ObjPath, u64, u64)> {
@@ -1176,7 +1202,7 @@ impl BackupTarget {
         }
     }
 
-    pub(crate) fn generation_key(&self, unix_nanos: u128) -> ObjPath {
+    fn generation_key(&self, unix_nanos: u128) -> ObjPath {
         join_key(
             &self.prefix,
             &format!("generations/gen-{unix_nanos:020}.manifest"),
@@ -2718,154 +2744,6 @@ async fn write_watermark(
     }
 }
 
-/// Which conditional-put mode a preflight probe found unenforced.
-///
-/// Both matter and they fail independently — a store can honour `If-None-Match`
-/// (guarding the bootstrap put) while ignoring `If-Match` (guarding every
-/// steady-state advance), or the reverse. Naming which one degraded is the
-/// difference between an operator fixing a bucket setting in a minute and
-/// bisecting a corruption in a week.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreflightStage {
-    /// [`PutMode::Create`] / `If-None-Match` — the guard on two writers
-    /// bootstrapping the same fresh sink.
-    Create,
-    /// [`PutMode::Update`] / `If-Match` — the guard on every subsequent
-    /// watermark advance, and therefore the one the steady state rests on.
-    Update,
-}
-
-impl PreflightStage {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PreflightStage::Create => "PutMode::Create (If-None-Match)",
-            PreflightStage::Update => "PutMode::Update (If-Match)",
-        }
-    }
-}
-
-/// What [`probe_conditional_puts`] observed at a real sink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreconditionSupport {
-    /// Both conditional modes were enforced — a put that should have been
-    /// rejected was rejected. The watermark CAS is real at this sink.
-    Honoured,
-    /// A put that *must* have failed its precondition succeeded instead, so
-    /// this backend has silently degraded to unconditional writes.
-    Degraded { stage: PreflightStage },
-}
-
-impl PreconditionSupport {
-    pub fn is_honoured(&self) -> bool {
-        matches!(self, PreconditionSupport::Honoured)
-    }
-}
-
-/// R732-T4: prove, against the *real* configured sink, that conditional puts
-/// are actually enforced — and hand the caller a hard answer so it can refuse
-/// to start when they are not.
-///
-/// [`write_watermark`] carries a deployment caveat that no test can close:
-/// if `AmazonS3Builder` is pointed at a store that does not honour
-/// `If-Match` / `If-None-Match`, every conditional put silently succeeds, the
-/// CAS degrades to last-write-wins, and the concurrent split-brain window
-/// W245 exists to shut reopens — while every unit test stays green, because
-/// the in-memory store used in tests does honour them. Support is a property
-/// of configuration, not of code, so a runtime probe is the only guard that
-/// can exist.
-///
-/// The probe writes a uniquely-keyed canary under `<prefix>/preflight/`,
-/// exercises both modes with puts that MUST be rejected, and deletes it. It
-/// touches no watermark, no manifest and no frame, so it is safe to run at
-/// startup against a live sink another node owns — and it is deliberately
-/// keyed per-process-per-nanosecond so two nodes probing at once cannot fail
-/// each other.
-///
-/// `Ok(Degraded)` is the interesting return and is NOT an error: the probe
-/// worked perfectly, and reported that the store is unsafe. An `Err` means the
-/// probe could not reach a verdict at all (sink unreachable, credentials
-/// wrong), which is also a refuse-to-start condition but a different one for
-/// an operator to read.
-pub async fn probe_conditional_puts(target: &BackupTarget) -> Result<PreconditionSupport> {
-    let key = join_key(
-        &target.prefix,
-        &format!("preflight/conditional-put-{:020}-{}.canary", unix_nanos(), std::process::id()),
-    );
-    let result = probe_at_key(&target.store, &key).await;
-    // Best-effort cleanup: a leaked canary is inert (nothing reads
-    // `preflight/`), so a delete failure must not mask the verdict — which is
-    // the whole reason the caller ran this.
-    if let Err(e) = target.store.delete(&key).await {
-        tracing_delete_failure(&key, &e);
-    }
-    result
-}
-
-/// The probe body, split out so the canary is deleted on every path.
-async fn probe_at_key(
-    store: &Arc<dyn ObjectStore>,
-    key: &ObjPath,
-) -> Result<PreconditionSupport> {
-    let create = PutOptions { mode: PutMode::Create, ..Default::default() };
-
-    // 1. Claim the key. This one is *expected* to succeed; if it doesn't, the
-    //    probe cannot reach a verdict (and `AlreadyExists` here means the
-    //    per-process-per-nanosecond key collided, which is a bug, not a store
-    //    property — so it stays an error rather than a `Degraded` verdict).
-    let first = store
-        .put_opts(key, b"preflight-1".as_slice().into(), create.clone())
-        .await
-        .with_context(|| format!("preflight canary could not be created at {key}"))?;
-    let v1 = UpdateVersion { e_tag: first.e_tag.clone(), version: first.version.clone() };
-
-    // 2. Create again over a key that now exists. A store honouring
-    //    `If-None-Match` rejects this; one that succeeds has degraded.
-    match store.put_opts(key, b"preflight-2".as_slice().into(), create).await {
-        Err(object_store::Error::AlreadyExists { .. })
-        | Err(object_store::Error::Precondition { .. }) => {}
-        Ok(_) => return Ok(PreconditionSupport::Degraded { stage: PreflightStage::Create }),
-        Err(e) => {
-            return Err(e).with_context(|| format!("preflight Create probe failed at {key}"))
-        }
-    }
-
-    // 3. Advance the canary conditionally on the version we hold, to obtain a
-    //    *superseded* version. Expected to succeed — it is the ordinary
-    //    steady-state write `write_watermark` makes.
-    store
-        .put_opts(
-            key,
-            b"preflight-3".as_slice().into(),
-            PutOptions { mode: PutMode::Update(v1.clone()), ..Default::default() },
-        )
-        .await
-        .with_context(|| format!("preflight Update probe could not advance {key}"))?;
-
-    // 4. Update again on the now-stale version — exactly the shape of a fenced
-    //    writer losing the watermark race. A store honouring `If-Match`
-    //    rejects it.
-    match store
-        .put_opts(
-            key,
-            b"preflight-4".as_slice().into(),
-            PutOptions { mode: PutMode::Update(v1), ..Default::default() },
-        )
-        .await
-    {
-        Err(object_store::Error::Precondition { .. })
-        | Err(object_store::Error::AlreadyExists { .. }) => Ok(PreconditionSupport::Honoured),
-        Ok(_) => Ok(PreconditionSupport::Degraded { stage: PreflightStage::Update }),
-        Err(e) => Err(e).with_context(|| format!("preflight Update probe failed at {key}")),
-    }
-}
-
-/// turso-backup takes no logging dependency (it is a library consumed by
-/// binaries that pick their own), so a failed canary cleanup goes to stderr
-/// rather than through `tracing`.
-fn tracing_delete_failure(key: &ObjPath, e: &object_store::Error) {
-    eprintln!("turso-backup: preflight canary {key} could not be deleted: {e}");
-}
-
 /// R574-T4: compute the watermark-staleness snapshot for this call. Pure so
 /// the breach edge cases are unit-testable without staging a sidecar.
 fn rpo_status(target: Option<Duration>, prior: Option<&PersistedWatermark>) -> RpoStatus {
@@ -2877,14 +2755,6 @@ fn rpo_status(target: Option<Duration>, prior: Option<&PersistedWatermark>) -> R
     RpoStatus { target, watermark_age, breached }
 }
 
-fn join_key(prefix: &str, leaf: &str) -> ObjPath {
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
-        ObjPath::from(leaf)
-    } else {
-        ObjPath::from(format!("{prefix}/{leaf}"))
-    }
-}
 
 fn unix_nanos() -> u128 {
     SystemTime::now()
@@ -3169,7 +3039,7 @@ async fn delete_collected(target: &BackupTarget, key: &ObjPath) -> Result<()> {
 /// `list_with_delimiter` costs one request per directory instead of one per
 /// page, and the tier-2 frame tree is three levels deep at most
 /// (`frames/{epoch}/{seq}/{object}`), so that is a handful of requests.
-async fn list_recursive(
+pub(crate) async fn list_recursive(
     store: &Arc<dyn ObjectStore>,
     root: &ObjPath,
 ) -> Result<Vec<object_store::ObjectMeta>> {
@@ -3189,6 +3059,7 @@ async fn list_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use store_claim::{probe_conditional_puts, PreconditionSupport, PreflightStage};
     use crate::backpressure::fault_injection::{Fault, FaultyStore};
     use crate::backpressure::BackoffConfig;
     use object_store::memory::InMemory;

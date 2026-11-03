@@ -97,7 +97,7 @@
 //! @yah:next("R006 complete pending sign-off: both children (F1, T2) in review. Optional follow-up — extend dedup-writer/verifier docker harness to call gc_dedup between snapshots and re-verify both restores against MinIO, parallel to R004-T4's tier-1b e2e shape. Not blocking R006 archive.")
 //! @yah:verify("cd /Users/user/ss/yah/external/turso-backup && cargo test --lib: 42/42 green (4 GC tests under dedup::tests::gc*). cargo clippy --all-targets clean.")
 
-use crate::snapshot::BackupTarget;
+use store_claim::{join_key, BackupTarget};
 use anyhow::{Context, Result};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt};
@@ -585,16 +585,6 @@ fn manifest_key(target: &BackupTarget, unix_nanos: u128) -> ObjPath {
     join_key(&target.prefix, &format!("manifests/manifest-{unix_nanos:020}.manifest"))
 }
 
-/// Join an object-store prefix and a leaf into a normalized [`ObjPath`],
-/// tolerating empty/slash-padded prefixes.
-fn join_key(prefix: &str, leaf: &str) -> ObjPath {
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
-        ObjPath::from(leaf)
-    } else {
-        ObjPath::from(format!("{prefix}/{leaf}"))
-    }
-}
 
 /// Lowercase-hex SHA-256 of a byte buffer.
 fn sha256_hex(bytes: &[u8]) -> String {

@@ -29,6 +29,10 @@
 //!   silence. Defaults to `4 * TAIL_INTERVAL_SECS`, which is a scheduler-slack
 //!   allowance and not a policy; declare `yah.durability.rpo-seconds` to mean
 //!   something by it.
+//! - `ADOPT` — `1` on a resume after a supervisor restart (R932-B2): keep the
+//!   claim this node already holds instead of minting a new epoch, and exit `2`
+//!   if it moved. Absent/`0` is a placement: take the claim, displacing whoever
+//!   has it.
 //! - `ROUNDS` — stop after N rounds instead of running forever. For tests and
 //!   one-shot operator runs; `0` (the default) means forever.
 //!
@@ -59,7 +63,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use turso_backup::hydrate::Tier;
-use turso_backup::tail::{round, start, RoundOutcome, SubjectOutcome, SubjectReport, TailRequest};
+use turso_backup::tail::{round, start, RoundOutcome, SubjectOutcome, SubjectReport, TailRefusal, TailRequest};
 
 /// Exit code for "another node owns this state" — see the module doc.
 const EXIT_FENCED: u8 = 2;
@@ -106,6 +110,7 @@ async fn run() -> Result<Verdict> {
         interval.as_secs().saturating_mul(DEFAULT_RPO_ROUNDS),
     )?);
     let rounds = parse_num("ROUNDS", 0)?;
+    let adopt = parse_num("ADOPT", 0)? != 0;
 
     let mut session = match start(TailRequest {
         store,
@@ -116,6 +121,7 @@ async fn run() -> Result<Verdict> {
         owner: &owner,
         page_size,
         rpo_target: Some(rpo),
+        adopt,
     })
     .await
     .with_context(|| format!("starting a tail of {} into {prefix}", volume_root.display()))?
@@ -126,6 +132,16 @@ async fn run() -> Result<Verdict> {
         // the supervisor should not stop it on this. It is an error the operator
         // has to fix — a bucket that cannot fence, or a genuinely concurrent
         // start — and the exit code says so.
+        // R932-B2: a resume that finds the claim moved is the fence verdict —
+        // another node owns this state and this copy is stale — so it exits 2
+        // and the supervisor stops the workload. It must NOT take a new epoch.
+        Err(refusal @ TailRefusal::ClaimMoved { .. }) => {
+            println!(
+                "{{\"outcome\":\"fenced\",\"detail\":{}}}",
+                json_string(&refusal.headline())
+            );
+            return Ok(Verdict::Fenced);
+        }
         Err(refusal) => bail!("{}", refusal.headline()),
     };
     println!(
@@ -311,7 +327,7 @@ fn store_from_env() -> Result<(Arc<dyn object_store::ObjectStore>, String)> {
     let secret = required("S3_SECRET_KEY")?;
     let prefix = required("BACKUP_PREFIX")?;
 
-    let store = AmazonS3Builder::new()
+    let store = turso_backup::bounded_s3(AmazonS3Builder::new())
         .with_endpoint(&endpoint)
         .with_bucket_name(&bucket)
         .with_access_key_id(&access)

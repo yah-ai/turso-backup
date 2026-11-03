@@ -54,6 +54,28 @@
 //! unreachable store is indistinguishable from the partition the fence exists
 //! for, which is exactly when starting is worst.
 //!
+//! # `verify` — check a chain restores, without the claim (R977-T17)
+//!
+//! `turso-backup-hydrate verify` restores the chain into `SCRATCH_DIR` (must
+//! not already hold the subjects) and runs `PRAGMA integrity_check` on each,
+//! reading and writing **no** ownership claim or fence, so it is safe on any
+//! node while the owner streams. Same store env as hydrate; `VOLUME_ROOT` and
+//! `OWNER` are not read. Exit 0 = `valid`, 2 = `corrupt` | `torn` |
+//! `nothing_in_the_store`, 1 = `error`.
+//!
+//! # `reseed` — recover a spliced chain (R977-T18)
+//!
+//! `turso-backup-hydrate reseed --source DIR --scratch DIR [--label YYYYMMDD]
+//! [--fence-owner OWNER] [--apply]` — see `turso_backup::reseed`. Dry-run by
+//! default: prints the plan and writes nothing. Env: `SUBJECTS`, `TIER`,
+//! `BACKUP_PREFIX`, `S3_BUCKET`, `S3_ENDPOINT`, `S3_REGION`; `OWNER` only with
+//! `--fence-owner`. Credentials are the node's own, the same pair kamaji hands
+//! the tail (R936-B13): `S3_ACCESS_KEY__<BUCKET>`/`S3_SECRET_KEY__<BUCKET>` from
+//! the environment, else read in place from
+//! `<cloud-conf-dir>/durability-cred-<bucket>.env`. A bare `S3_ACCESS_KEY` is not
+//! read, and there is no flag for another cred file. Exit 0 = `planned` |
+//! `applied` (verified), 2 = `refused`, 1 = `error` (including a failed verify).
+//!
 //! [`hydrate`]: turso_backup::hydrate::hydrate
 
 use anyhow::{bail, Context, Result};
@@ -62,13 +84,25 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use turso_backup::hydrate::{hydrate, HydrateOutcome, HydrateRequest, Tier};
+use turso_backup::hydrate::{
+    hydrate, verify, Chain, HydrateOutcome, HydrateRequest, Tier, VerifyOutcome,
+};
+use turso_backup::reseed::{reseed, ReseedOutcome, ReseedPlan, ReseedRequest};
 
 /// Exit code for a reached verdict of "do not start". See the module doc.
 const EXIT_REFUSED: u8 = 2;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    match env::args().nth(1).as_deref() {
+        None => {}
+        Some("verify") => return verify_main().await,
+        Some("reseed") => return reseed_main().await,
+        Some(other) => {
+            eprintln!("unknown verb {other:?}; usage: turso-backup-hydrate [verify|reseed]");
+            return ExitCode::FAILURE;
+        }
+    }
     match run().await {
         Ok(outcome) => {
             println!("{}", outcome_to_json(&outcome));
@@ -104,6 +138,278 @@ async fn run() -> Result<HydrateOutcome> {
     })
     .await
     .with_context(|| format!("hydrating {} from {prefix}", volume_root.display()))
+}
+
+async fn verify_main() -> ExitCode {
+    match run_verify().await {
+        Ok(outcome) => {
+            println!("{}", verify_to_json(&outcome));
+            match outcome {
+                VerifyOutcome::Valid { .. } => ExitCode::SUCCESS,
+                _ => ExitCode::from(EXIT_REFUSED),
+            }
+        }
+        Err(err) => {
+            println!(
+                "{{\"outcome\":\"error\",\"message\":{}}}",
+                json_string(&format!("{err:#}"))
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_verify() -> Result<VerifyOutcome> {
+    let scratch = PathBuf::from(required("SCRATCH_DIR")?);
+    let subjects = parse_subjects(&required("SUBJECTS")?)?;
+    let tier = parse_tier(&required("TIER")?)?;
+    let (store, prefix) = store_from_env()?;
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("creating scratch dir {}", scratch.display()))?;
+    let chain = Chain {
+        store,
+        store_prefix: &prefix,
+        subjects: &subjects,
+        tier,
+    };
+    verify(&chain, &scratch)
+        .await
+        .with_context(|| format!("verifying {prefix} into {}", scratch.display()))
+}
+
+async fn reseed_main() -> ExitCode {
+    match run_reseed().await {
+        Ok(outcome) => {
+            println!("{}", reseed_to_json(&outcome));
+            match outcome {
+                ReseedOutcome::Refused(_) => ExitCode::from(EXIT_REFUSED),
+                _ => ExitCode::SUCCESS,
+            }
+        }
+        Err(err) => {
+            println!(
+                "{{\"outcome\":\"error\",\"message\":{}}}",
+                json_string(&format!("{err:#}"))
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+struct ReseedArgs {
+    source: PathBuf,
+    scratch: PathBuf,
+    label: Option<String>,
+    fence_owner: Option<String>,
+    apply: bool,
+}
+
+fn parse_reseed_args(args: &[String]) -> Result<ReseedArgs> {
+    let (mut source, mut scratch, mut label, mut fence_owner, mut apply) =
+        (None, None, None, None, false);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || it.next().cloned().with_context(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--source" => source = Some(PathBuf::from(val()?)),
+            "--scratch" => scratch = Some(PathBuf::from(val()?)),
+            "--label" => label = Some(val()?),
+            "--fence-owner" => fence_owner = Some(val()?),
+            "--apply" => apply = true,
+            other => bail!("unknown reseed argument {other:?}"),
+        }
+    }
+    Ok(ReseedArgs {
+        source: source.context("--source <volume dir> is required")?,
+        scratch: scratch.context("--scratch <empty dir> is required")?,
+        label,
+        fence_owner,
+        apply,
+    })
+}
+
+/// The bucket-scoped env-var suffix kamaji uses (R936-B13 `bucket_env_suffix`).
+fn bucket_env_suffix(bucket: &str) -> String {
+    bucket
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect()
+}
+
+/// The node's own credential for `bucket`: scoped env first, else the node's
+/// cred file read in place. Never a bare pair, never a caller-named file.
+fn node_credentials(bucket: &str) -> Result<(String, String)> {
+    let sfx = bucket_env_suffix(bucket);
+    let (ak, sk) = (format!("S3_ACCESS_KEY__{sfx}"), format!("S3_SECRET_KEY__{sfx}"));
+    if let (Ok(a), Ok(s)) = (env::var(&ak), env::var(&sk)) {
+        return Ok((a, s));
+    }
+    let file = format!("/etc/yah-cloud/durability-cred-{bucket}.env");
+    let text = std::fs::read_to_string(&file).with_context(|| {
+        format!(
+            "no {ak}/{sk} in the environment and {file} is not readable \
+             (run as root on a node that holds the bucket's cred)"
+        )
+    })?;
+    let (a, s) = parse_cred_env(&text, &ak, &sk);
+    Ok((
+        a.with_context(|| format!("{file} has no {ak}"))?,
+        s.with_context(|| format!("{file} has no {sk}"))?,
+    ))
+}
+
+/// `KEY=value` lines, systemd EnvironmentFile shape; optional quotes stripped.
+fn parse_cred_env(text: &str, ak: &str, sk: &str) -> (Option<String>, Option<String>) {
+    let (mut a, mut s) = (None, None);
+    for line in text.lines() {
+        let Some((k, v)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+        match k.trim() {
+            k if k == ak => a = Some(v),
+            k if k == sk => s = Some(v),
+            _ => {}
+        }
+    }
+    (a, s)
+}
+
+/// Today's UTC date as `YYYYMMDD`, the default label.
+fn today_label() -> String {
+    let days = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        / 86_400) as i64;
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}{m:02}{d:02}")
+}
+
+async fn run_reseed() -> Result<ReseedOutcome> {
+    let args: Vec<String> = env::args().skip(2).collect();
+    let a = parse_reseed_args(&args)?;
+    let subjects = parse_subjects(&required("SUBJECTS")?)?;
+    let tier = parse_tier(&required("TIER")?)?;
+    let bucket = required("S3_BUCKET")?;
+    let prefix = required("BACKUP_PREFIX")?;
+    let owner = match a.fence_owner {
+        Some(_) => required("OWNER")?,
+        None => String::new(),
+    };
+    let (access, secret) = node_credentials(&bucket)?;
+    let store = build_store(&bucket, &access, &secret)?;
+    let label = a.label.unwrap_or_else(today_label);
+    reseed(ReseedRequest {
+        chain: Chain {
+            store,
+            store_prefix: &prefix,
+            subjects: &subjects,
+            tier,
+        },
+        source_root: &a.source,
+        scratch_root: &a.scratch,
+        label: &label,
+        owner: &owner,
+        fence_owner: a.fence_owner.as_deref(),
+        apply: a.apply,
+    })
+    .await
+    .with_context(|| format!("reseeding {prefix} from {}", a.source.display()))
+}
+
+fn reseed_plan_json(p: &ReseedPlan) -> String {
+    let list = |v: &[String]| v.iter().map(|s| json_string(s)).collect::<Vec<_>>().join(",");
+    format!(
+        "\"claim\":{},\"fence\":{},\"archive_prefix\":{},\"archive\":[{}],\"subjects\":[{}]",
+        p.claim.as_ref().map_or("null".to_string(), |c| format!(
+            "{{\"owner\":{},\"epoch\":{}}}",
+            json_string(&c.owner),
+            c.epoch
+        )),
+        p.fence,
+        json_string(&p.archive_prefix),
+        list(&p.archive),
+        p.subjects
+            .iter()
+            .map(|s| format!(
+                "{{\"subject\":{},\"source_bytes\":{},\"supersede\":[{}]}}",
+                json_string(&s.subject),
+                s.source_bytes,
+                list(&s.supersede)
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn reseed_to_json(outcome: &ReseedOutcome) -> String {
+    match outcome {
+        ReseedOutcome::Planned(p) => {
+            format!("{{\"outcome\":\"planned\",{}}}", reseed_plan_json(p))
+        }
+        ReseedOutcome::Applied {
+            plan,
+            fenced_at,
+            snapshots,
+            verify,
+        } => format!(
+            "{{\"outcome\":\"applied\",{},\"fenced_at\":{},\"snapshots\":[{}],\"verify\":{}}}",
+            reseed_plan_json(plan),
+            fenced_at.map_or("null".to_string(), |e| e.to_string()),
+            snapshots
+                .iter()
+                .map(|s| json_string(s))
+                .collect::<Vec<_>>()
+                .join(","),
+            verify_to_json(verify)
+        ),
+        ReseedOutcome::Refused(r) => format!(
+            "{{\"outcome\":\"refused\",\"reason\":{},\"message\":{}}}",
+            json_string(r.kind()),
+            json_string(&r.headline())
+        ),
+    }
+}
+
+fn verify_to_json(outcome: &VerifyOutcome) -> String {
+    let list = |v: &[String]| v.iter().map(|s| json_string(s)).collect::<Vec<_>>().join(",");
+    match outcome {
+        VerifyOutcome::Valid { subjects, seconds } => format!(
+            "{{\"outcome\":\"valid\",\"seconds\":{seconds:.3},\"restored\":[{}]}}",
+            subjects
+                .iter()
+                .map(|s| format!(
+                    "{{\"subject\":{},\"source\":{},\"bytes\":{},\"frames_replayed\":{}}}",
+                    json_string(&s.subject),
+                    json_string(&s.source),
+                    s.bytes,
+                    s.frames_replayed.map_or("null".to_string(), |n| n.to_string())
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        VerifyOutcome::Corrupt { subject, problems } => format!(
+            "{{\"outcome\":\"corrupt\",\"subject\":{},\"problems\":[{}]}}",
+            json_string(subject),
+            list(problems)
+        ),
+        VerifyOutcome::Torn { present, absent } => format!(
+            "{{\"outcome\":\"torn\",\"present\":[{}],\"absent\":[{}]}}",
+            list(present),
+            list(absent)
+        ),
+        VerifyOutcome::NothingInTheStore => "{\"outcome\":\"nothing_in_the_store\"}".to_string(),
+    }
 }
 
 fn required(key: &str) -> Result<String> {
@@ -152,18 +458,25 @@ fn parse_tier(raw: &str) -> Result<Tier> {
 }
 
 fn store_from_env() -> Result<(Arc<dyn object_store::ObjectStore>, String)> {
-    let endpoint = env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://minio:9000".to_string());
-    let region = env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let bucket = required("S3_BUCKET")?;
     let access = required("S3_ACCESS_KEY")?;
     let secret = required("S3_SECRET_KEY")?;
     let prefix = required("BACKUP_PREFIX")?;
+    Ok((build_store(&bucket, &access, &secret)?, prefix))
+}
 
-    let store = AmazonS3Builder::new()
+fn build_store(
+    bucket: &str,
+    access: &str,
+    secret: &str,
+) -> Result<Arc<dyn object_store::ObjectStore>> {
+    let endpoint = env::var("S3_ENDPOINT").unwrap_or_else(|_| "http://minio:9000".to_string());
+    let region = env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    let store = turso_backup::bounded_s3(AmazonS3Builder::new())
         .with_endpoint(&endpoint)
-        .with_bucket_name(&bucket)
-        .with_access_key_id(&access)
-        .with_secret_access_key(&secret)
+        .with_bucket_name(bucket)
+        .with_access_key_id(access)
+        .with_secret_access_key(secret)
         .with_region(&region)
         // The claim's compare-and-swap rests on these headers being emitted.
         // Setting this is necessary and not sufficient — `hydrate` probes the
@@ -173,7 +486,7 @@ fn store_from_env() -> Result<(Arc<dyn object_store::ObjectStore>, String)> {
         .with_virtual_hosted_style_request(false)
         .build()
         .with_context(|| format!("building S3-shaped store for {endpoint} bucket={bucket}"))?;
-    Ok((Arc::new(store), prefix))
+    Ok(Arc::new(store))
 }
 
 fn outcome_to_json(outcome: &HydrateOutcome) -> String {
@@ -238,6 +551,7 @@ fn refusal_kind(refusal: &turso_backup::hydrate::HydrateRefusal) -> &'static str
         R::FencedMidRestore { .. } => "fenced_mid_restore",
         R::SinkNotFenced { .. } => "sink_not_fenced",
         R::StaleVolumeNothingToRestore { .. } => "stale_volume_nothing_to_restore",
+        R::ChainUnrestorable { .. } => "chain_unrestorable",
     }
 }
 
@@ -265,8 +579,30 @@ fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use turso_backup::claim::{ClaimLost, ClaimRecord};
+    use store_claim::claim::{ClaimLost, ClaimRecord};
     use turso_backup::hydrate::{HydrateRefusal, SubjectRestore};
+
+    #[test]
+    fn reseed_credentials_use_kamajis_bucket_scoped_names() {
+        assert_eq!(bucket_env_suffix("noisetable-account-backup"), "NOISETABLE_ACCOUNT_BACKUP");
+        let (a, s) = parse_cred_env(
+            "# c\nS3_ACCESS_KEY__B=ak\nS3_SECRET_KEY__B=\"sk\"\nS3_ACCESS_KEY=bare\n",
+            "S3_ACCESS_KEY__B",
+            "S3_SECRET_KEY__B",
+        );
+        assert_eq!((a.as_deref(), s.as_deref()), (Some("ak"), Some("sk")));
+    }
+
+    #[test]
+    fn reseed_is_dry_run_unless_apply_is_given() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let a = parse_reseed_args(&args(&["--source", "/v", "--scratch", "/s"])).unwrap();
+        assert!(!a.apply && a.fence_owner.is_none());
+        let a = parse_reseed_args(&args(&["--source", "/v", "--scratch", "/s", "--apply"])).unwrap();
+        assert!(a.apply);
+        assert!(parse_reseed_args(&args(&["--scratch", "/s"])).is_err());
+        assert_eq!(today_label().len(), 8);
+    }
 
     #[test]
     fn subjects_split_and_trim() {
@@ -357,9 +693,15 @@ mod tests {
             ),
             (
                 HydrateRefusal::SinkNotFenced {
-                    stage: turso_backup::stream::PreflightStage::Update,
+                    stage: store_claim::PreflightStage::Update,
                 },
                 "sink_not_fenced",
+            ),
+            (
+                HydrateRefusal::ChainUnrestorable {
+                    reason: "a.db fails integrity_check".into(),
+                },
+                "chain_unrestorable",
             ),
         ];
         for (refusal, tag) in cases {

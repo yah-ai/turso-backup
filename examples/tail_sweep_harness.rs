@@ -115,7 +115,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use turso_backup::backpressure::BackpressureConfig;
-use turso_backup::snapshot::{snapshot_and_upload, BackupTarget, SnapshotOutcome};
+use store_claim::BackupTarget;
+use turso_backup::snapshot::{snapshot_and_upload, SnapshotOutcome};
 use turso_backup::stream::{tail_frames, CoreWalSeam, StreamConfig, StreamOutcome};
 
 /// Matches the WAL page size the live-DB tests in `stream.rs` use and

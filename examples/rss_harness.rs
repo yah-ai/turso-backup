@@ -75,7 +75,8 @@ use object_store::memory::InMemory;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use turso_backup::snapshot::{snapshot_and_upload, BackupTarget, SnapshotOutcome};
+use store_claim::BackupTarget;
+use turso_backup::snapshot::{snapshot_and_upload, SnapshotOutcome};
 use turso_backup::stream::{restore_latest_stream, tail_frames, CoreWalSeam, StreamConfig};
 
 /// Matches the WAL page size the live-DB tests in `stream.rs` use; turso's

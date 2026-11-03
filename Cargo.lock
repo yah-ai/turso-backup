@@ -2789,6 +2789,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "store-claim"
+version = "0.8.51"
+dependencies = [
+ "anyhow",
+ "object_store",
+ "tokio",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3313,7 +3322,7 @@ dependencies = [
 
 [[package]]
 name = "turso-backup"
-version = "0.8.46"
+version = "0.8.51"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3321,6 +3330,7 @@ dependencies = [
  "hex",
  "object_store",
  "sha2",
+ "store-claim",
  "tokio",
  "turso",
  "turso_core",

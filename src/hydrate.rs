@@ -75,9 +75,8 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use object_store::ObjectStore;
 
-use crate::claim::{self, ClaimLost, ClaimOutcome, ClaimRecord};
-use crate::snapshot::BackupTarget;
-use crate::stream::{PreconditionSupport, PreflightStage};
+use store_claim::claim::{self, ClaimLost, ClaimOutcome, ClaimRecord};
+use store_claim::{BackupTarget, PreconditionSupport, PreflightStage};
 
 /// The bytes-shipping half of a durability tier.
 ///
@@ -326,6 +325,10 @@ pub enum HydrateRefusal {
     /// a stale history and an empty one are both wrong, and choosing between
     /// them is an operator's call.
     StaleVolumeNothingToRestore { owner: String, epoch: u64 },
+    /// R977-B19: the pre-claim [`verify`] says the store's chain does not
+    /// restore (corrupt or torn). No claim was taken. Retrying changes nothing;
+    /// the chain needs `turso-backup-hydrate reseed`.
+    ChainUnrestorable { reason: String },
 }
 
 impl HydrateRefusal {
@@ -364,6 +367,10 @@ impl HydrateRefusal {
                  but the store holds nothing to restore. The local files were left in place; \
                  decide by hand whether they or an empty start is authoritative"
             ),
+            HydrateRefusal::ChainUnrestorable { reason } => format!(
+                "the store's durability chain does not restore ({reason}); no claim was taken. \
+                 Retrying will not help: recover it with `turso-backup-hydrate reseed`"
+            ),
         }
     }
 }
@@ -393,6 +400,32 @@ impl HydrateRequest<'_> {
         }
     }
 
+    /// The claim-free half of this request: everything [`restore_all`] reads.
+    fn chain(&self) -> Chain<'_> {
+        Chain {
+            store: self.store.clone(),
+            store_prefix: self.store_prefix,
+            subjects: self.subjects,
+            tier: self.tier,
+        }
+    }
+}
+
+/// A workload's durability chain in the store: where it is and how to read it.
+///
+/// R977-T17. This is what a restore needs and *all* it needs — there is no
+/// owner here on purpose. [`hydrate`] is claim + restore of a `Chain`;
+/// [`verify`] is restore of a `Chain` only, so the type itself is the proof
+/// that verify cannot read or write a claim or fence.
+pub struct Chain<'a> {
+    pub store: Arc<dyn ObjectStore>,
+    /// Key prefix for the workload; each subject hangs one level below.
+    pub store_prefix: &'a str,
+    pub subjects: &'a [String],
+    pub tier: Tier,
+}
+
+impl Chain<'_> {
     fn subject_target(&self, subject: &str) -> BackupTarget {
         let prefix = self.store_prefix.trim_matches('/');
         BackupTarget {
@@ -403,6 +436,99 @@ impl HydrateRequest<'_> {
                 format!("{prefix}/{subject}")
             },
         }
+    }
+}
+
+/// What [`verify`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VerifyOutcome {
+    /// Every subject restored, opened and returned `ok` from
+    /// `PRAGMA integrity_check`.
+    Valid {
+        subjects: Vec<SubjectRestore>,
+        seconds: f64,
+    },
+    /// A subject restored but did not open, or `integrity_check` reported
+    /// problems. `problems` is the check's own rows (or the open error).
+    Corrupt {
+        subject: String,
+        problems: Vec<String>,
+    },
+    /// The store holds some subjects and not others.
+    Torn {
+        present: Vec<String>,
+        absent: Vec<String>,
+    },
+    /// The store holds nothing for any subject.
+    NothingInTheStore,
+}
+
+/// R977-T17 — restore `chain` into `scratch_root` and check that every subject
+/// opens and passes `PRAGMA integrity_check`, **without reading or writing the
+/// ownership claim or fence**.
+///
+/// [`hydrate`] is the only other way to prove a chain restores, and it takes
+/// the claim — run on a third node, that fences the live owner's tail
+/// (measured in R977-B15 phase A). `scratch_root` must hold none of the
+/// subjects already; a populated scratch dir would be verified as-is and
+/// prove nothing about the store.
+pub async fn verify(chain: &Chain<'_>, scratch_root: &Path) -> Result<VerifyOutcome> {
+    let states = inspect_volume(scratch_root, chain.subjects)?;
+    if let Some((s, _)) = states.iter().find(|(_, st)| *st != SubjectState::Absent) {
+        bail!(
+            "scratch dir {} already holds {s}; verify restores into an empty dir",
+            scratch_root.display()
+        );
+    }
+    let started = Instant::now();
+    let mut restored = Vec::new();
+    let mut missing = Vec::new();
+    restore_all(chain, scratch_root, &mut restored, &mut missing).await?;
+    if restored.is_empty() {
+        return Ok(VerifyOutcome::NothingInTheStore);
+    }
+    if !missing.is_empty() {
+        return Ok(VerifyOutcome::Torn {
+            present: restored.into_iter().map(|r| r.subject).collect(),
+            absent: missing,
+        });
+    }
+    for r in &restored {
+        let path = subject_path(scratch_root, &r.subject)?;
+        let problems = integrity_problems(&path).await;
+        if !problems.is_empty() {
+            return Ok(VerifyOutcome::Corrupt {
+                subject: r.subject.clone(),
+                problems,
+            });
+        }
+    }
+    Ok(VerifyOutcome::Valid {
+        subjects: restored,
+        seconds: started.elapsed().as_secs_f64(),
+    })
+}
+
+/// Open `path` and run `PRAGMA integrity_check`; empty means `ok`.
+async fn integrity_problems(path: &Path) -> Vec<String> {
+    let run = async {
+        let p = path
+            .to_str()
+            .with_context(|| format!("path {} is not UTF-8", path.display()))?;
+        let db = turso::Builder::new_local(p).build().await?;
+        let conn = db.connect()?;
+        let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get::<String>(0)?);
+        }
+        anyhow::Ok(out)
+    };
+    match run.await {
+        Ok(rows) if rows == ["ok"] => Vec::new(),
+        Ok(rows) if rows.is_empty() => vec!["integrity_check returned no rows".into()],
+        Ok(rows) => rows,
+        Err(e) => vec![format!("opening {}: {e:#}", path.display())],
     }
 }
 
@@ -419,7 +545,7 @@ impl HydrateRequest<'_> {
 /// indistinguishable from the partition the fence exists for.
 pub async fn hydrate(req: HydrateRequest<'_>) -> Result<HydrateOutcome> {
     let states = inspect_volume(req.volume_root, req.subjects)?;
-    let mut displaced = None;
+    let mut stale_against = None;
     match assess(&states)? {
         // R936-B2: "populated" is not "current". The one node whose local copy
         // is known current is the node that last held the claim, because the
@@ -429,10 +555,18 @@ pub async fn hydrate(req: HydrateRequest<'_>) -> Result<HydrateOutcome> {
         // the holder still mints nothing. An unreachable store is an `Err`
         // (do not start), the same posture as every other store failure here.
         Readiness::AlreadyPopulated => match claim::read_claim(&req.workload_target()).await? {
-            Some(held) if held.owner != req.owner && owner_names_a_node(&held.owner) => {
-                displaced = Some(displace_volume(req.volume_root, req.subjects, &held)?);
-            }
-            _ => return Ok(HydrateOutcome::AlreadyPopulated),
+            Some(held) => match volume_currency(req.volume_root, &held, req.owner)? {
+                VolumeCurrency::Current => return Ok(HydrateOutcome::AlreadyPopulated),
+                // The first start after this marker shipped: the claim holder is
+                // the only writer, so its own unmarked volume is current. Stamp
+                // it so every later start is checked against the store.
+                VolumeCurrency::AdoptUnmarked => {
+                    write_volume_marker(req.volume_root, &held.owner, held.epoch)?;
+                    return Ok(HydrateOutcome::AlreadyPopulated);
+                }
+                VolumeCurrency::Stale => stale_against = Some(held),
+            },
+            None => return Ok(HydrateOutcome::AlreadyPopulated),
         },
         Readiness::TornVolume { populated, absent } => {
             return Ok(HydrateOutcome::Refused(HydrateRefusal::TornVolume {
@@ -446,11 +580,25 @@ pub async fn hydrate(req: HydrateRequest<'_>) -> Result<HydrateOutcome> {
     let started = Instant::now();
     let workload_target = req.workload_target();
 
+    // R977-B19: prove the chain restores BEFORE taking the claim. A chain that
+    // cannot restore used to cost an epoch on every attempt (the floater retries
+    // every 30 s; noisetable epochs reached 6208). The real restore still runs
+    // after the claim below, because claiming first is what fences the old
+    // owner's tail; this only gates it. Runs before displacement so a refusal
+    // leaves a stale volume exactly where it was.
+    if let Some(refusal) = preflight_chain(&req).await? {
+        return Ok(HydrateOutcome::Refused(refusal));
+    }
+    let displaced = match &stale_against {
+        Some(held) => Some(displace_volume(req.volume_root, req.subjects, held)?),
+        None => None,
+    };
+
     // Prove the fence is real before leaning on it. Deliberately *after* the
     // readiness check: an ordinary restart takes no claim, so it should not pay
     // for a probe or be blocked by a degraded sink it never writes to.
     if let PreconditionSupport::Degraded { stage } =
-        crate::stream::probe_conditional_puts(&workload_target).await?
+        store_claim::probe_conditional_puts(&workload_target).await?
     {
         return Ok(HydrateOutcome::Refused(HydrateRefusal::SinkNotFenced {
             stage,
@@ -475,7 +623,7 @@ pub async fn hydrate(req: HydrateRequest<'_>) -> Result<HydrateOutcome> {
     // base with none of its frames applied. Clearing the subjects sends the
     // next attempt back through a full restore. The displaced copy stays aside:
     // putting it back would serve it under this node's claim, which is worse.
-    if let Err(e) = restore_all(&req, &mut restored, &mut missing).await {
+    if let Err(e) = restore_all(&req.chain(), req.volume_root, &mut restored, &mut missing).await {
         clear_subjects(req.volume_root, req.subjects);
         return Err(e.context(
             "restore failed after the claim was taken; the partial restore was removed \
@@ -517,6 +665,7 @@ pub async fn hydrate(req: HydrateRequest<'_>) -> Result<HydrateOutcome> {
             subjects: missing,
         });
     }
+    write_volume_marker(req.volume_root, req.owner, epoch)?;
     Ok(HydrateOutcome::Hydrated {
         epoch,
         subjects: restored,
@@ -525,15 +674,46 @@ pub async fn hydrate(req: HydrateRequest<'_>) -> Result<HydrateOutcome> {
     })
 }
 
+/// R977-B19 — [`verify`] the chain into a scratch dir next to the volume,
+/// taking no claim. `Some` is a refusal: the store's chain is corrupt or torn,
+/// and no retry will change that until an operator reseeds it. A verify that
+/// errors (unreachable store) stays an `Err`, which callers may retry.
+async fn preflight_chain(req: &HydrateRequest<'_>) -> Result<Option<HydrateRefusal>> {
+    let scratch = PathBuf::from(format!(
+        "{}.hydrate-preflight-{}",
+        req.volume_root.display(),
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch)
+        .with_context(|| format!("creating preflight scratch {}", scratch.display()))?;
+    let outcome = verify(&req.chain(), &scratch).await;
+    let _ = std::fs::remove_dir_all(&scratch);
+    Ok(match outcome? {
+        VerifyOutcome::Corrupt { subject, problems } => Some(HydrateRefusal::ChainUnrestorable {
+            reason: format!("{subject} fails integrity_check: {}", problems.join("; ")),
+        }),
+        VerifyOutcome::Torn { present, absent } => Some(HydrateRefusal::ChainUnrestorable {
+            reason: format!(
+                "store is torn: {} present, {} absent",
+                present.join(", "),
+                absent.join(", ")
+            ),
+        }),
+        VerifyOutcome::Valid { .. } | VerifyOutcome::NothingInTheStore => None,
+    })
+}
+
 /// Restore every subject into the volume, recording each one in `restored`, or
 /// in `missing` if the store has nothing for it.
 async fn restore_all(
-    req: &HydrateRequest<'_>,
+    chain: &Chain<'_>,
+    volume_root: &Path,
     restored: &mut Vec<SubjectRestore>,
     missing: &mut Vec<String>,
 ) -> Result<()> {
-    for subject in req.subjects {
-        let dest = subject_path(req.volume_root, subject)?;
+    for subject in chain.subjects {
+        let dest = subject_path(volume_root, subject)?;
         // A subject in a subdirectory of the volume needs that subdirectory to
         // exist; runc's bind mount does not create it and neither does the
         // restore, which writes a file.
@@ -545,10 +725,10 @@ async fn restore_all(
             .to_str()
             .with_context(|| format!("subject path {} is not UTF-8", dest.display()))?;
 
-        let target = req.subject_target(subject);
+        let target = chain.subject_target(subject);
         let subject_started = Instant::now();
         let Some((source, frames_replayed)) =
-            restore_subject(&target, req.tier, dest_str).await?
+            restore_subject(&target, chain.tier, dest_str).await?
         else {
             missing.push(subject.clone());
             continue;
@@ -580,6 +760,70 @@ fn clear_subjects(volume_root: &Path, subjects: &[String]) {
             let _ = std::fs::remove_file(&p);
         }
     }
+}
+
+/// R1013-B2 — file in the volume root recording which claim (owner + epoch) the
+/// volume's contents were last written under. Without it "populated" could only
+/// be compared by owner label, and a stale copy whose label matched the claim
+/// (or a legacy `kamaji-pid-*` claim) was served silently, weeks behind the store.
+pub const VOLUME_MARKER: &str = ".turso-backup-claim";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeMarker {
+    pub owner: String,
+    pub epoch: u64,
+}
+
+/// Record that the volume is current as of `(owner, epoch)`. Called after a
+/// successful hydrate and by [`crate::tail::start`] once its epoch is known.
+pub fn write_volume_marker(volume_root: &Path, owner: &str, epoch: u64) -> Result<()> {
+    std::fs::create_dir_all(volume_root)
+        .with_context(|| format!("creating volume root {}", volume_root.display()))?;
+    let path = volume_root.join(VOLUME_MARKER);
+    let tmp = volume_root.join(format!("{VOLUME_MARKER}.tmp"));
+    // One line, `<epoch> <owner>`: the crate carries no serde, and this is all it holds.
+    let body = format!("{epoch} {owner}\n").into_bytes();
+    std::fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
+    Ok(())
+}
+
+fn read_volume_marker(volume_root: &Path) -> Result<Option<VolumeMarker>> {
+    let path = volume_root.join(VOLUME_MARKER);
+    match std::fs::read(&path) {
+        Ok(b) => Ok((|| {
+            let text = String::from_utf8(b).ok()?;
+            let (epoch, owner) = text.trim_end_matches('\n').split_once(' ')?;
+            Some(VolumeMarker { owner: owner.to_string(), epoch: epoch.parse().ok()? })
+        })()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum VolumeCurrency {
+    Current,
+    /// No usable marker, but the claim names this very owner (or a legacy
+    /// process label that cannot prove otherwise): one-time rollout adoption.
+    AdoptUnmarked,
+    Stale,
+}
+
+/// Compare a populated volume's marker with the store's current claim.
+fn volume_currency(
+    volume_root: &Path,
+    held: &claim::ClaimRecord,
+    owner: &str,
+) -> Result<VolumeCurrency> {
+    Ok(match read_volume_marker(volume_root)? {
+        Some(m) if m.epoch == held.epoch && m.owner == held.owner => VolumeCurrency::Current,
+        Some(_) => VolumeCurrency::Stale,
+        None if held.owner == owner || !owner_names_a_node(&held.owner) => {
+            VolumeCurrency::AdoptUnmarked
+        }
+        None => VolumeCurrency::Stale,
+    })
 }
 
 /// Whether a claim's owner label identifies a NODE, which is the only thing that
@@ -816,9 +1060,28 @@ mod tests {
 
     /// A byte string `upload_base_snapshot` will accept — it refuses anything
     /// without the SQLite magic, so a hand-rolled fixture has to carry it.
+    /// A valid one-page empty SQLite database, `tag` written into the page's
+    /// unallocated space so images differ. R977-B19: hydrate now verifies the
+    /// chain (integrity_check) before claiming, so fixtures must be databases.
     fn db_image(tag: &[u8]) -> Vec<u8> {
-        let mut v = b"SQLite format 3\0".to_vec();
-        v.extend_from_slice(tag);
+        let mut v = vec![0u8; 4096];
+        v[..16].copy_from_slice(b"SQLite format 3\0");
+        v[16..18].copy_from_slice(&4096u16.to_be_bytes());
+        v[18] = 1; // write version
+        v[19] = 1; // read version
+        v[21] = 64;
+        v[22] = 32;
+        v[23] = 32;
+        v[24..28].copy_from_slice(&1u32.to_be_bytes()); // change counter
+        v[28..32].copy_from_slice(&1u32.to_be_bytes()); // size in pages
+        v[44..48].copy_from_slice(&4u32.to_be_bytes()); // schema format
+        v[56..60].copy_from_slice(&1u32.to_be_bytes()); // UTF-8
+        v[92..96].copy_from_slice(&1u32.to_be_bytes()); // version-valid-for
+        v[96..100].copy_from_slice(&3_045_000u32.to_be_bytes());
+        // sqlite_master: empty leaf table page, content area starts at 4096.
+        v[100] = 0x0D;
+        v[105..107].copy_from_slice(&4096u16.to_be_bytes());
+        v[200..200 + tag.len()].copy_from_slice(tag);
         v
     }
 
@@ -986,6 +1249,83 @@ mod tests {
         assert_eq!(claim::read_claim(&target).await.unwrap().unwrap(), before);
     }
 
+    /// R1013-B2: a marker behind the store's epoch means the volume is stale
+    /// even when the owner label matches the claim. Displace, hydrate, restamp.
+    #[tokio::test]
+    async fn a_marker_behind_the_store_epoch_is_displaced_and_hydrated() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        seed_snapshot(&store, "wl/acct/accounts.db", b"CURRENT").await;
+        let target = BackupTarget { store: store.clone(), prefix: "wl/acct".into() };
+        let ClaimOutcome::Granted { claim: held, .. } =
+            claim::acquire(&target, "us-east-001").await.unwrap()
+        else {
+            panic!("seeding the claim");
+        };
+        let dir = tempdir("marker-behind");
+        std::fs::write(dir.join("accounts.db"), b"STALE-SEP-23").unwrap();
+        write_volume_marker(&dir, "us-east-001", held.epoch - 1).unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+
+        let out = hydrate(request(&store, &dir, &subjects, "us-east-001")).await.unwrap();
+        let HydrateOutcome::Hydrated { epoch, displaced: Some(d), .. } = out else {
+            panic!("expected Hydrated with a displacement, got {out:?}");
+        };
+        assert!(epoch > held.epoch);
+        assert_eq!(std::fs::read(dir.join("accounts.db")).unwrap(), db_image(b"CURRENT"));
+        assert_eq!(
+            std::fs::read(dir.join(format!("accounts.db.{}", d.suffix))).unwrap(),
+            b"STALE-SEP-23"
+        );
+        assert_eq!(
+            read_volume_marker(&dir).unwrap(),
+            Some(VolumeMarker { owner: "us-east-001".into(), epoch })
+        );
+    }
+
+    /// R1013-B2: a marker equal to the store's claim is current.
+    #[tokio::test]
+    async fn a_marker_matching_the_store_claim_is_already_populated() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        seed_snapshot(&store, "wl/acct/accounts.db", b"OLD-BACKUP").await;
+        let target = BackupTarget { store: store.clone(), prefix: "wl/acct".into() };
+        let ClaimOutcome::Granted { claim: held, .. } =
+            claim::acquire(&target, "us-west-001").await.unwrap()
+        else {
+            panic!("seeding the claim");
+        };
+        let dir = tempdir("marker-current");
+        std::fs::write(dir.join("accounts.db"), b"LIVE").unwrap();
+        write_volume_marker(&dir, "us-west-001", held.epoch).unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+
+        let out = hydrate(request(&store, &dir, &subjects, "us-west-001")).await.unwrap();
+        assert_eq!(out, HydrateOutcome::AlreadyPopulated);
+        assert_eq!(std::fs::read(dir.join("accounts.db")).unwrap(), b"LIVE");
+        assert_eq!(claim::read_claim(&target).await.unwrap().unwrap(), held);
+    }
+
+    /// R1013-B2: a non-empty volume with no marker, under a claim held by a
+    /// different node, is stale (the only unmarked volume trusted is the claim
+    /// holder's own, for the one-time rollout).
+    #[tokio::test]
+    async fn an_unmarked_volume_under_a_foreign_claim_is_stale() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        seed_snapshot(&store, "wl/acct/accounts.db", b"CURRENT").await;
+        let target = BackupTarget { store: store.clone(), prefix: "wl/acct".into() };
+        claim::acquire(&target, "us-south-001").await.unwrap();
+        let dir = tempdir("unmarked-foreign");
+        std::fs::write(dir.join("accounts.db"), b"STALE").unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+
+        let out = hydrate(request(&store, &dir, &subjects, "us-east-001")).await.unwrap();
+        assert!(
+            matches!(out, HydrateOutcome::Hydrated { displaced: Some(_), .. }),
+            "got {out:?}"
+        );
+        assert_eq!(std::fs::read(dir.join("accounts.db")).unwrap(), db_image(b"CURRENT"));
+        assert!(read_volume_marker(&dir).unwrap().is_some());
+    }
+
     /// A legacy process-scoped claim (`kamaji-pid-<pid>`) cannot prove another
     /// node streamed after this volume: the node that minted it may be this
     /// one. Keep the volume, restore nothing; the tail re-mints under the node
@@ -1011,7 +1351,8 @@ mod tests {
         assert_eq!(out, HydrateOutcome::AlreadyPopulated);
         assert_eq!(std::fs::read(dir.join("accounts.db")).unwrap(), b"NEWER-LOCAL");
         assert_eq!(std::fs::read(dir.join("accounts.db-wal")).unwrap(), b"LOCAL-WAL");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "nothing displaced");
+        // 2 files + the adopted volume's freshly stamped marker.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "nothing displaced");
         assert_eq!(claim::read_claim(&target).await.unwrap().unwrap(), before);
     }
 
@@ -1145,11 +1486,52 @@ mod tests {
         let subjects = vec!["accounts.db".to_string(), "sessions.db".to_string()];
 
         let out = hydrate(request(&store, &dir, &subjects, "n1")).await.unwrap();
-        let HydrateOutcome::Refused(HydrateRefusal::TornVolume { populated, absent }) = out else {
-            panic!("expected TornVolume, got {out:?}");
+        // R977-B19: caught by the pre-claim verify, so no epoch is minted.
+        let HydrateOutcome::Refused(HydrateRefusal::ChainUnrestorable { reason }) = out else {
+            panic!("expected ChainUnrestorable, got {out:?}");
         };
-        assert_eq!(populated, vec!["accounts.db".to_string()]);
-        assert_eq!(absent, vec!["sessions.db".to_string()]);
+        assert!(reason.contains("sessions.db"), "{reason}");
+        let target = BackupTarget {
+            store: store.clone(),
+            prefix: "wl/acct".into(),
+        };
+        assert_eq!(claim::read_claim(&target).await.unwrap(), None);
+    }
+
+    /// R977-B19: a chain that does not pass integrity_check is refused BEFORE
+    /// the claim, so retries leave the live claim and its epoch untouched.
+    #[tokio::test]
+    async fn a_corrupt_chain_is_refused_without_moving_the_claim_epoch() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let target = BackupTarget {
+            store: store.clone(),
+            prefix: "wl/acct".into(),
+        };
+        claim::acquire(&target, "us-south-001").await.unwrap();
+        let before = claim::read_claim(&target).await.unwrap().unwrap();
+        crate::snapshot::upload_base_snapshot(
+            &BackupTarget {
+                store: store.clone(),
+                prefix: "wl/acct/accounts.db".into(),
+            },
+            b"SQLite format 3\0GARBAGE",
+        )
+        .await
+        .unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+        for attempt in 0..3 {
+            let dir = tempdir(&format!("corrupt-{attempt}"));
+            let out = hydrate(request(&store, &dir, &subjects, "us-west-003"))
+                .await
+                .unwrap();
+            let HydrateOutcome::Refused(refusal @ HydrateRefusal::ChainUnrestorable { .. }) = out
+            else {
+                panic!("expected ChainUnrestorable, got {out:?}");
+            };
+            assert!(refusal.headline().contains("reseed"), "{}", refusal.headline());
+            assert!(!dir.join("accounts.db").exists());
+        }
+        assert_eq!(claim::read_claim(&target).await.unwrap().unwrap(), before);
     }
 
     /// Step 3 of the protocol, and the check that is easy to leave out: a
@@ -1324,6 +1706,9 @@ mod tests {
     struct FailingGetStore {
         inner: Arc<dyn ObjectStore>,
         poison: &'static str,
+        /// Poisoned GETs let through first. R977-B19: 1 lets the pre-claim
+        /// verify pass so the failure lands in the post-claim restore.
+        pass_first: std::sync::atomic::AtomicUsize,
     }
 
     impl std::fmt::Display for FailingGetStore {
@@ -1361,7 +1746,16 @@ mod tests {
             location: &object_store::path::Path,
             options: object_store::GetOptions,
         ) -> object_store::Result<object_store::GetResult> {
-            if location.as_ref().contains(self.poison) {
+            if location.as_ref().contains(self.poison)
+                && self
+                    .pass_first
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_err()
+            {
                 return Err(object_store::Error::Generic {
                     store: "FailingGetStore",
                     source: "injected mid-restore failure".into(),
@@ -1417,6 +1811,7 @@ mod tests {
         let failing: Arc<dyn ObjectStore> = Arc::new(FailingGetStore {
             inner: inner.clone(),
             poison: "b.db/snapshots/",
+            pass_first: 1.into(),
         });
         let dir = tempdir("fail-mid-restore");
         let subjects = vec!["a.db".to_string(), "b.db".to_string()];
@@ -1457,6 +1852,9 @@ mod tests {
         rival_epoch: u64,
         rival_owner: String,
         fired: std::sync::atomic::AtomicBool,
+        /// R977-B19: snapshot listings seen. The first belongs to the pre-claim
+        /// verify; the rival fires on the post-claim restore's.
+        snapshot_lists: std::sync::atomic::AtomicUsize,
     }
 
     impl RacingStore {
@@ -1541,6 +1939,10 @@ mod tests {
         ) -> object_store::Result<object_store::ListResult> {
             if self.when == RivalOn::SnapshotRead
                 && prefix.is_some_and(|p| p.as_ref().ends_with("snapshots"))
+                && self
+                    .snapshot_lists
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    >= 1
             {
                 self.fire().await?;
             }
@@ -1565,6 +1967,7 @@ mod tests {
             rival_epoch,
             rival_owner: rival_owner.to_string(),
             fired: std::sync::atomic::AtomicBool::new(false),
+            snapshot_lists: 0.into(),
         })
     }
 
@@ -1584,5 +1987,112 @@ mod tests {
             std::fs::read(dir.join("db/accounts.db")).unwrap(),
             db_image(b"NESTED")
         );
+    }
+
+    // ── verify: restore without the claim (R977-T17) ────────────────────────
+
+    /// A real turso database image, so `integrity_check` has something to pass.
+    async fn real_db_image(tag: &str) -> Vec<u8> {
+        let dir = tempdir(tag);
+        let path = dir.join("src.db");
+        let p = path.to_str().unwrap();
+        {
+            let db = turso::Builder::new_local(p).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
+                .await
+                .unwrap();
+            conn.execute("INSERT INTO t (v) VALUES ('a'), ('b')", ())
+                .await
+                .unwrap();
+            let mut r = conn.query("PRAGMA wal_checkpoint(TRUNCATE)", ()).await.unwrap();
+            while r.next().await.unwrap().is_some() {}
+        }
+        std::fs::read(&path).unwrap()
+    }
+
+    fn chain<'a>(store: &Arc<dyn ObjectStore>, subjects: &'a [String]) -> Chain<'a> {
+        Chain {
+            store: store.clone(),
+            store_prefix: "wl/acct",
+            subjects,
+            tier: Tier::Snapshot,
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_restores_a_valid_chain_and_leaves_the_owners_claim_alone() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let target = BackupTarget {
+            store: store.clone(),
+            prefix: "wl/acct".into(),
+        };
+        claim::acquire(&target, "us-south-001").await.unwrap();
+        let before = claim::read_claim(&target).await.unwrap().unwrap();
+        let image = real_db_image("verify-src").await;
+        crate::snapshot::upload_base_snapshot(
+            &BackupTarget {
+                store: store.clone(),
+                prefix: "wl/acct/accounts.db".into(),
+            },
+            &image,
+        )
+        .await
+        .unwrap();
+
+        let subjects = vec!["accounts.db".to_string()];
+        let scratch = tempdir("verify-ok");
+        let out = verify(&chain(&store, &subjects), &scratch).await.unwrap();
+        assert!(matches!(out, VerifyOutcome::Valid { ref subjects, .. } if subjects.len() == 1), "{out:?}");
+        assert_eq!(
+            claim::read_claim(&target).await.unwrap().unwrap(),
+            before,
+            "verify must not move the live owner's claim or epoch"
+        );
+        // The owner can still prove it holds the fence at its epoch.
+        assert!(claim::assert_holds(&target, before.epoch).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_takes_no_claim_on_an_unclaimed_chain() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        seed_snapshot(&store, "wl/acct/accounts.db", b"X").await;
+        let subjects = vec!["accounts.db".to_string()];
+        let scratch = tempdir("verify-noclaim");
+        verify(&chain(&store, &subjects), &scratch).await.unwrap();
+        let target = BackupTarget {
+            store: store.clone(),
+            prefix: "wl/acct".into(),
+        };
+        assert_eq!(claim::read_claim(&target).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn verify_reports_a_chain_that_does_not_pass_integrity_check() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        // Header magic and nothing else: restores, cannot be a database.
+        crate::snapshot::upload_base_snapshot(
+            &BackupTarget {
+                store: store.clone(),
+                prefix: "wl/acct/accounts.db".into(),
+            },
+            b"SQLite format 3\0GARBAGE",
+        )
+        .await
+        .unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+        let out = verify(&chain(&store, &subjects), &tempdir("verify-bad"))
+            .await
+            .unwrap();
+        assert!(matches!(out, VerifyOutcome::Corrupt { .. }), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn verify_refuses_a_populated_scratch_dir() {
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let scratch = tempdir("verify-full");
+        std::fs::write(scratch.join("accounts.db"), b"x").unwrap();
+        let subjects = vec!["accounts.db".to_string()];
+        assert!(verify(&chain(&store, &subjects), &scratch).await.is_err());
     }
 }

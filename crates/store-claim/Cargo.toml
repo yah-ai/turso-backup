@@ -1,0 +1,19 @@
+[package]
+name = "store-claim"
+version = "0.8.51"
+edition = "2021"
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/turso-backup"
+description = "Object-store fencing primitives: BackupTarget, the store-side ownership claim (epoch mint + assert), and the conditional-put preflight probe. Depends on object_store and anyhow only."
+
+# R971-T6: lifted out of turso-backup so a consumer that only needs the claim
+# (W363 fleet git remote) does not link a database engine. Deliberately no
+# turso, tokio or sha2 here; tokio is a dev-dependency for the async tests only.
+[dependencies]
+# Same pin as turso-backup (0.14, R903-T1); keep in lockstep.
+object_store = "0.14"
+anyhow = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }

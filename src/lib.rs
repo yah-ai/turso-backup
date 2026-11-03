@@ -45,17 +45,37 @@
 //! @yah:next("R003-F3: implement restore_latest (object_store get + write file)")
 //! @yah:next("R003-T4: green e2e in harness (writer -> snapshot sink -> MinIO -> restore -> verifier)")
 
+/// R977-B19: per-request timeout for every S3 store the bins build.
+pub const S3_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// R977-B19: total time object_store may spend retrying one request
+/// (object_store's own default is 180 s; a list + a get at that ceiling is the
+/// shape of the 364 s headscale restore R977-B16 measured).
+pub const S3_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Apply [`S3_REQUEST_TIMEOUT`] / [`S3_RETRY_TIMEOUT`] to an S3 builder.
+pub fn bounded_s3(b: object_store::aws::AmazonS3Builder) -> object_store::aws::AmazonS3Builder {
+    b.with_client_options(
+        object_store::ClientOptions::new()
+            .with_timeout(S3_REQUEST_TIMEOUT)
+            .with_connect_timeout(std::time::Duration::from_secs(5)),
+    )
+    .with_retry(object_store::RetryConfig {
+        retry_timeout: S3_RETRY_TIMEOUT,
+        ..Default::default()
+    })
+}
+
 pub mod snapshot;
 pub mod dedup;
 pub mod stream;
 pub mod backpressure;
 pub mod puller;
-/// R850-F1: mints the fencing epoch `stream::StreamConfig::epoch` enforces, for
-/// callers with no raft state machine to ask.
-pub mod claim;
 /// R850-F1: hydrate-on-place — fill an empty volume's declared databases from
-/// the store before the workload starts, under a [`claim`].
+/// the store before the workload starts, under a [`store_claim::claim`].
 pub mod hydrate;
+/// R977-T18: recover a spliced durability chain — fresh tier-1a snapshot from
+/// a chosen volume, spliced manifests moved aside (never deleted), then verify.
+pub mod reseed;
 /// R850-F1: the other half of [`hydrate`] — keep a *running* appliance's
 /// declared databases shipped to the store, beside an application that holds
 /// them open, under the same [`claim`].

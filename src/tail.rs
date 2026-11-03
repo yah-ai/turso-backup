@@ -66,12 +66,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use object_store::{ObjectStore, ObjectStoreExt};
 
-use crate::claim::{self, ClaimLost, ClaimOutcome, ClaimRecord};
+use store_claim::claim::{self, ClaimLost, ClaimOutcome, ClaimRecord};
+use store_claim::{BackupTarget, PreconditionSupport, PreflightStage};
 use crate::dedup::{self, DedupOutcome};
 use crate::hydrate::{subject_path, Tier};
-use crate::snapshot::{self, BackupTarget, SnapshotOutcome};
+use crate::snapshot::{self, SnapshotOutcome};
 use crate::stream::{
-    self, CoreWalSeam, PreconditionSupport, PreflightStage, SourceFingerprint, StreamConfig,
+    self, CoreWalSeam, SourceFingerprint, StreamKeys, StreamConfig,
     StreamOutcome,
 };
 
@@ -108,6 +109,14 @@ pub struct TailRequest<'a> {
     /// RPO the caller's scheduler promises, carried into the watermark so a
     /// missed round is visible as a breach rather than as silence.
     pub rpo_target: Option<Duration>,
+    /// R932-B2: this is a **resume** — the caller already held the claim before
+    /// it restarted — not a placement. When set, [`start`] never mints a new
+    /// epoch for a prefix somebody else holds: a claim owned by `owner` is
+    /// adopted at its existing epoch, a claim owned by anyone else is refused
+    /// with [`TailRefusal::ClaimMoved`], and only an absent claim is acquired.
+    /// A fresh deploy leaves this `false`: placement decided this node should
+    /// own the workload, and displacing the previous owner is the point.
+    pub adopt: bool,
 }
 
 /// Why a tail could not start. Every variant means **do not stream**, and the
@@ -124,6 +133,11 @@ pub enum TailRefusal {
     /// this is the genuinely concurrent case, and retrying it is the caller's
     /// call, not ours.
     ClaimLost { current: ClaimRecord },
+    /// R932-B2: an [`TailRequest::adopt`] resume found the claim held by another
+    /// owner. Unlike [`TailRefusal::ClaimLost`] this IS "somebody else owns
+    /// this": the claim moved while the caller was down, and whatever it is
+    /// still running is a stale copy. Nothing was written.
+    ClaimMoved { current: ClaimRecord },
 }
 
 impl TailRefusal {
@@ -138,6 +152,11 @@ impl TailRefusal {
             ),
             TailRefusal::ClaimLost { current } => format!(
                 "lost the ownership claim race to epoch {} (owner {})",
+                current.epoch, current.owner
+            ),
+            TailRefusal::ClaimMoved { current } => format!(
+                "the ownership claim moved to epoch {} (owner {}) while this node was down; \
+                 refusing to take a new epoch for a stale copy",
                 current.epoch, current.owner
             ),
         }
@@ -247,15 +266,31 @@ pub async fn start(req: TailRequest<'_>) -> Result<std::result::Result<TailSessi
     };
 
     if let PreconditionSupport::Degraded { stage } =
-        stream::probe_conditional_puts(&workload_target).await?
+        store_claim::probe_conditional_puts(&workload_target).await?
     {
         return Ok(Err(TailRefusal::SinkNotFenced { stage }));
     }
 
-    let (epoch, displaced) = match claim::acquire(&workload_target, req.owner).await? {
-        ClaimOutcome::Granted { claim, previous } => (claim.epoch, previous),
-        ClaimOutcome::Lost { current } => return Ok(Err(TailRefusal::ClaimLost { current })),
+    let adopted = if req.adopt {
+        match claim::read_claim(&workload_target).await? {
+            Some(c) if c.owner == req.owner => Some(c.epoch),
+            Some(current) => return Ok(Err(TailRefusal::ClaimMoved { current })),
+            None => None,
+        }
+    } else {
+        None
     };
+    let (epoch, displaced) = match adopted {
+        Some(epoch) => (epoch, None),
+        None => match claim::acquire(&workload_target, req.owner).await? {
+            ClaimOutcome::Granted { claim, previous } => (claim.epoch, previous),
+            ClaimOutcome::Lost { current } => return Ok(Err(TailRefusal::ClaimLost { current })),
+        },
+    };
+
+    // R1013-B2: stamp the volume with the claim it now writes under, so the
+    // next hydrate can tell this copy from a stale one.
+    crate::hydrate::write_volume_marker(req.volume_root, req.owner, epoch)?;
 
     let prefix = req.store_prefix.trim_matches('/');
     let mut subjects = Vec::with_capacity(req.subjects.len());
@@ -804,6 +839,7 @@ mod tests {
             owner,
             page_size: 4096,
             rpo_target: None,
+            adopt: false,
         }
     }
 
@@ -1041,6 +1077,72 @@ mod tests {
         };
         assert!(matches!(reports[0].outcome, SubjectOutcome::Stream { .. }));
         assert_eq!(reports[1].outcome, SubjectOutcome::Absent);
+    }
+
+    /// R932-B2, the incident: node-a holds the claim, node-b took it over, and
+    /// node-a's kamaji restarts and resumes. Resume must stand down rather than
+    /// mint an epoch above node-b's, which would fence the live owner.
+    #[tokio::test]
+    async fn a_resume_after_the_claim_moved_takes_no_new_epoch() {
+        let vol = Volume::new("adopt-moved");
+        let subjects = vec!["accounts.db".to_string()];
+        seed(&vol.subject("accounts.db"), 0, 20).await;
+
+        let store = store();
+        start(request(store.clone(), &vol, &subjects, Tier::Stream, "node-a"))
+            .await
+            .unwrap()
+            .expect("start a");
+        let b = start(request(store.clone(), &vol, &subjects, Tier::Stream, "node-b"))
+            .await
+            .unwrap()
+            .expect("start b");
+
+        let mut resume = request(store.clone(), &vol, &subjects, Tier::Stream, "node-a");
+        resume.adopt = true;
+        match start(resume).await.unwrap() {
+            Err(TailRefusal::ClaimMoved { current }) => {
+                assert_eq!(current.owner, "node-b");
+                assert_eq!(current.epoch, b.epoch());
+            }
+            Err(other) => panic!("wrong refusal: {}", other.headline()),
+            Ok(s) => panic!("a stale resume took epoch {}", s.epoch()),
+        }
+        let target = BackupTarget { store, prefix: "workloads/acct".to_string() };
+        assert_eq!(claim::read_claim(&target).await.unwrap().unwrap().epoch, b.epoch());
+    }
+
+    /// The other half: a resume by the claim's own holder keeps its epoch, so a
+    /// kamaji restart no longer churns the fence.
+    #[tokio::test]
+    async fn a_resume_by_the_claim_holder_keeps_its_epoch() {
+        let vol = Volume::new("adopt-own");
+        let subjects = vec!["accounts.db".to_string()];
+        seed(&vol.subject("accounts.db"), 0, 20).await;
+
+        let store = store();
+        let first = start(request(store.clone(), &vol, &subjects, Tier::Stream, "node-a"))
+            .await
+            .unwrap()
+            .expect("start a");
+        let mut resume = request(store, &vol, &subjects, Tier::Stream, "node-a");
+        resume.adopt = true;
+        let mut again = start(resume).await.unwrap().expect("adopt");
+        assert_eq!(again.epoch(), first.epoch());
+        assert!(again.displaced().is_none());
+        assert!(matches!(round(&mut again).await.unwrap(), RoundOutcome::Backed(_)));
+    }
+
+    /// An absent claim is not a moved one: a resume on a virgin prefix acquires.
+    #[tokio::test]
+    async fn a_resume_on_an_unclaimed_prefix_acquires() {
+        let vol = Volume::new("adopt-virgin");
+        let subjects = vec!["accounts.db".to_string()];
+        seed(&vol.subject("accounts.db"), 0, 5).await;
+        let mut resume = request(store(), &vol, &subjects, Tier::Stream, "node-a");
+        resume.adopt = true;
+        let s = start(resume).await.unwrap().expect("acquire");
+        assert_eq!(s.epoch(), claim::FIRST_EPOCH);
     }
 
     /// The fence, from the losing side. A second node's `start` displaces the

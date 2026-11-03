@@ -58,7 +58,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use turso_backup::backpressure::BackpressureConfig;
-use turso_backup::snapshot::{upload_base_snapshot, BackupTarget};
+use store_claim::BackupTarget;
+use turso_backup::snapshot::upload_base_snapshot;
 use turso_backup::stream::{
     raw_consistent_copy_live, restore_latest_stream, tail_frames, CoreWalSeam, StreamConfig,
     StreamOutcome, WalSeam,

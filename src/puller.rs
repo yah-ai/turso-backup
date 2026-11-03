@@ -88,7 +88,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use crate::snapshot::BackupTarget;
+use store_claim::BackupTarget;
 use crate::stream::{
     for_each_frame_in_generation, list_and_parse_generation_manifests, validate_generation_chain,
     CoreWalSeam, WalGeneration, WalInsertSeam, Watermark,
@@ -392,7 +392,6 @@ impl<'a> WalPuller<'a> {
 mod tests {
     use super::*;
     use crate::backpressure::BackpressureConfig;
-    use crate::snapshot::BackupTarget;
     use crate::stream::{tail_frames, FrameInfo, StreamConfig, WalSeam, WAL_FRAME_HEADER_SIZE};
     use object_store::memory::InMemory;
     use object_store::path::Path as ObjPath;

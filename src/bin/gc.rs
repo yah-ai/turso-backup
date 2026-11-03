@@ -49,7 +49,7 @@ use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
-use turso_backup::snapshot::BackupTarget;
+use store_claim::BackupTarget;
 use turso_backup::stream::{gc_stream, StreamGcConfig, StreamGcOutcome};
 
 #[tokio::main(flavor = "current_thread")]
@@ -110,7 +110,7 @@ fn backup_target_from_env() -> Result<BackupTarget> {
     let region = env_or("S3_REGION", "us-east-1");
     let prefix = env_or("BACKUP_PREFIX", "snap");
 
-    let store = AmazonS3Builder::new()
+    let store = turso_backup::bounded_s3(AmazonS3Builder::new())
         .with_endpoint(&endpoint)
         .with_bucket_name(&bucket)
         .with_access_key_id(&access)

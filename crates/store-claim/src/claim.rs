@@ -4,7 +4,7 @@
 //!
 //! # Why this exists next to the fence it feeds
 //!
-//! [`stream::StreamConfig::epoch`] enforces at-most-one-writer on the R2 path,
+//! `turso_backup::stream::StreamConfig::epoch` enforces at-most-one-writer on the R2 path,
 //! but it does not *mint* anything — it takes a `u64` the caller was handed by
 //! somebody else. For a **tenant** that somebody is yubaba's raft state machine
 //! (`YubabaState::tenant_fencing_token`, W245/R732-F1), and
@@ -14,7 +14,7 @@
 //! volume — has no such record. There is no `WorkloadOwnership` in the raft
 //! state machine, and adding one would still not answer the question that
 //! matters here, because two sovereign groups are independent raft groups that
-//! share no epoch counter (the same gap [`stream::StreamConfig::pointer_generation`]
+//! share no epoch counter (the same gap `turso_backup::stream::StreamConfig::pointer_generation`
 //! exists to cover for tenants). So an appliance that wants to hydrate its
 //! state from an object store on a *new* node has no authority to ask whether
 //! the old node is still alive.
@@ -28,7 +28,7 @@
 //!   one cannot.
 //! - It already supports compare-and-swap, and turso-backup already refuses to
 //!   run against a sink where it silently degrades
-//!   ([`stream::probe_conditional_puts`]). The primitive is deployed and
+//!   (`crate::probe_conditional_puts`). The primitive is deployed and
 //!   verified, not assumed.
 //!
 //! # What a claim is and is not
@@ -64,33 +64,27 @@
 //!    ran, the bytes on this disk are already owned by somebody else and
 //!    starting would produce the second live writer the whole archetype
 //!    forbids.
-//! 4. Run, tailing under `StreamConfig::epoch = E`. A [`stream::StreamOutcome::Fenced`]
+//! 4. Run, tailing under `StreamConfig::epoch = E`. A `turso_backup::stream::StreamOutcome::Fenced`
 //!    from any later tail means step 3's race happened after the start, and the
 //!    supervisor must stop the workload.
 //!
-//! [`stream::StreamConfig::epoch`]: crate::stream::StreamConfig::epoch
-//! [`stream::StreamConfig::pointer_generation`]: crate::stream::StreamConfig::pointer_generation
-//! [`stream::probe_conditional_puts`]: crate::stream::probe_conditional_puts
-//! [`stream::StreamOutcome::Fenced`]: crate::stream::StreamOutcome::Fenced
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, UpdateVersion};
 
-use crate::snapshot::BackupTarget;
+use crate::{join_key, unix_nanos, BackupTarget};
 
 /// The epoch an unfenced writer uses, and the value
-/// [`stream::StreamConfig::epoch`] documents as "unfenced".
+/// `turso_backup::stream::StreamConfig::epoch` documents as "unfenced".
 ///
 /// No claim ever carries it: [`acquire`] on a virgin prefix mints
 /// [`FIRST_EPOCH`]. It exists here so a reader of this module does not have to
 /// go and check whether `0` is a legal claim (it is not) and so
 /// [`ClaimRecord::parse`] can reject it by name.
 ///
-/// [`stream::StreamConfig::epoch`]: crate::stream::StreamConfig::epoch
 pub const UNFENCED_EPOCH: u64 = 0;
 
 /// The epoch the first successful [`acquire`] against a prefix mints.
@@ -110,7 +104,7 @@ const CLAIM_LEAF: &str = "latest.owner-claim";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimRecord {
     /// The fencing token. Feed this to
-    /// [`StreamConfig::epoch`](crate::stream::StreamConfig::epoch).
+    /// `turso_backup::stream::StreamConfig::epoch`.
     pub epoch: u64,
     /// Opaque label for *who* holds `epoch` — a node id, a hostname, a
     /// `<machine>/<workload>` pair. Never interpreted here, and never used to
@@ -178,7 +172,7 @@ pub enum ClaimOutcome {
     ///
     /// Displacing a live owner is *legal and expected* — that is what a
     /// takeover is. What it is not is silent: the displaced writer's next tail
-    /// bounces [`Fenced`](crate::stream::StreamOutcome::Fenced).
+    /// bounces `turso_backup::stream::StreamOutcome::Fenced`.
     Granted {
         claim: ClaimRecord,
         previous: Option<ClaimRecord>,
@@ -369,26 +363,6 @@ pub async fn assert_holds(
         })),
         None => Ok(Err(ClaimLost::Vanished { ours: epoch })),
     }
-}
-
-/// Join an object-store prefix and a leaf into a normalized [`ObjPath`],
-/// tolerating empty/slash-padded prefixes. Same helper as `dedup`/`stream`;
-/// duplicated rather than shared because each module keeps its own private copy
-/// and hoisting it is a wider change than this ticket.
-fn join_key(prefix: &str, leaf: &str) -> ObjPath {
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
-        ObjPath::from(leaf)
-    } else {
-        ObjPath::from(format!("{prefix}/{leaf}"))
-    }
-}
-
-fn unix_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

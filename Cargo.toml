@@ -1,6 +1,6 @@
 [package]
 name = "turso-backup"
-version = "0.8.46"
+version = "0.8.51"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
@@ -13,6 +13,14 @@ categories = ["database"]
 # uses object_store for S3-compatible upload/download. Async via tokio.
 # R003-T1 spike: sibling >> wrapper; name confirmed; deps pinned for tier 1a.
 # Backing doc: .yah/docs/working/turso-s3-backup.md
+
+# R971-T6: store-claim (BackupTarget, the ownership claim, the conditional-put
+# probe) lives in a member crate so a consumer that needs only the claim does not
+# link a database engine. This is a genuine workspace of its own (oss/ crates are
+# excluded from yah's root), so no `workspace = true` inheritance anywhere.
+[workspace]
+members = [".", "crates/store-claim"]
+package = { version = "0.8.51" }
 
 [dependencies]
 # Bumped 0.6.1 -> 0.7.2 in R830 (0.6.1 loses writes behind a live Rows).
@@ -40,6 +48,8 @@ turso_core = { version = "0.7.2", features = ["conn_raw_api"] }
 # leaves root selection to the consumer.
 object_store = { version = "0.14", features = ["aws"] }
 anyhow = "1"
+# R971-T6: lifted out of this crate; published alongside it in the same workspace.
+store-claim = { path = "crates/store-claim", version = "0.8.51" }
 # "time" added for R574-F2: the R2-backpressure retry loop (stream.rs /
 # backpressure.rs) needs tokio::time::sleep for 429/503 backoff.
 tokio = { version = "1", features = ["rt", "macros", "time"] }

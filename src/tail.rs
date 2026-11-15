@@ -138,6 +138,16 @@ pub enum TailRefusal {
     /// this": the claim moved while the caller was down, and whatever it is
     /// still running is a stale copy. Nothing was written.
     ClaimMoved { current: ClaimRecord },
+    /// R1028-B5: an [`TailRequest::adopt`] resume found no volume root. A resume
+    /// means this node was already streaming this volume, so the directory
+    /// existed; its absence means something deleted it under the running
+    /// workload. On 2026-11-03 the resume's marker write `create_dir_all`-ed an
+    /// empty root back into place, which made the deletion look like a fresh
+    /// volume and left the tail reporting `absent` for hours. Refused before any
+    /// store traffic; nothing was created or written. Not the fence: the
+    /// process may still hold the deleted files open (`/proc/<pid>/fd`), the
+    /// only live copy, so the workload must not be stopped over this.
+    VolumeMissing { volume_root: PathBuf },
 }
 
 impl TailRefusal {
@@ -158,6 +168,12 @@ impl TailRefusal {
                 "the ownership claim moved to epoch {} (owner {}) while this node was down; \
                  refusing to take a new epoch for a stale copy",
                 current.epoch, current.owner
+            ),
+            TailRefusal::VolumeMissing { volume_root } => format!(
+                "volume root {} is gone on a resume: it was deleted under the running workload. \
+                 Refusing to recreate it empty. The process may still hold the deleted \
+                 databases open; copy them out of /proc/<pid>/fd before restarting it",
+                volume_root.display()
             ),
         }
     }
@@ -188,6 +204,9 @@ struct SubjectState {
     /// Tier 2 only: the base snapshot the frames are anchored to. `None` until
     /// one is published (or discovered) — see [`SubjectOutcome::Stream`].
     base_snapshot_key: Option<String>,
+    /// The database existed at some round of this session. Once true, a
+    /// missing file is [`SubjectOutcome::Vanished`], never `Absent`.
+    seen_present: bool,
 }
 
 /// What one subject's turn in a round did.
@@ -198,6 +217,17 @@ pub enum SubjectOutcome {
     /// after a first placement legitimately find nothing. Reported rather than
     /// skipped silently so "why is this subject not backed up" has an answer.
     Absent,
+    /// The database is missing but it was not lazily uncreated: it was present
+    /// earlier this session, or the store already holds a snapshot of it. Its
+    /// file was deleted, or the volume was replaced under the workload. The
+    /// running process may still be serving the deleted inode, so this is
+    /// data at risk, not a neutral state (R1028-B4). On 2026-11-03 a prod
+    /// appliance's volume dir was deleted and recreated empty under its
+    /// container, and the tail said `absent` every round for hours.
+    ///
+    /// Reported, not fatal: stopping the workload would discard the only live
+    /// copy, which is still recoverable from `/proc/<pid>/fd`.
+    Vanished { detail: String },
     /// The source database was moving under every attempt to copy it, so
     /// nothing was published this round.
     ///
@@ -265,6 +295,16 @@ pub async fn start(req: TailRequest<'_>) -> Result<std::result::Result<TailSessi
         prefix: req.store_prefix.to_string(),
     };
 
+    // R1028-B5: only a resume can prove the root should already exist. A
+    // placement starts the tail after the container, whose bind already
+    // created the root, so `write_volume_marker`'s create_dir_all below is a
+    // no-op on that path.
+    if req.adopt && !req.volume_root.is_dir() {
+        return Ok(Err(TailRefusal::VolumeMissing {
+            volume_root: req.volume_root.to_path_buf(),
+        }));
+    }
+
     if let PreconditionSupport::Degraded { stage } =
         store_claim::probe_conditional_puts(&workload_target).await?
     {
@@ -307,6 +347,7 @@ pub async fn start(req: TailRequest<'_>) -> Result<std::result::Result<TailSessi
             },
             name: name.clone(),
             base_snapshot_key: None,
+            seen_present: false,
         });
     }
 
@@ -380,13 +421,20 @@ pub async fn round(session: &mut TailSession) -> Result<RoundOutcome> {
     for subject in &mut session.subjects {
         let started = Instant::now();
         if !subject.path.exists() {
+            let outcome = match vanished_because(subject).await? {
+                Some(why) => SubjectOutcome::Vanished {
+                    detail: format!("{} is missing but {why}", subject.path.display()),
+                },
+                None => SubjectOutcome::Absent,
+            };
             reports.push(SubjectReport {
                 subject: subject.name.clone(),
-                outcome: SubjectOutcome::Absent,
+                outcome,
                 seconds: started.elapsed().as_secs_f64(),
             });
             continue;
         }
+        subject.seen_present = true;
         let outcome = back_up_subject(
             subject,
             &workload_target,
@@ -429,6 +477,24 @@ fn fenced_detail(lost: &ClaimLost) -> String {
         // unreachable store.
         ClaimLost::Vanished { .. } => format!("{lost}; treating that as fenced"),
     }
+}
+
+/// Why a missing subject is [`SubjectOutcome::Vanished`] rather than lazily
+/// absent, if it is. The store check survives a tail restart that the
+/// in-session flag does not. It finds tier 1a/2 snapshots and tier-1b dedup
+/// manifests, so a restarted tail of any tier knows the subject was backed up.
+async fn vanished_because(subject: &SubjectState) -> Result<Option<&'static str>> {
+    if subject.seen_present {
+        return Ok(Some("it was present earlier in this session"));
+    }
+    let checking = || format!("checking whether missing subject {} was ever backed up", subject.name);
+    if subject.base_snapshot_key.is_some()
+        || snapshot::latest_snapshot_key(&subject.target).await.with_context(checking)?.is_some()
+        || dedup::load_latest_manifest(&subject.target).await.with_context(checking)?.is_some()
+    {
+        return Ok(Some("the store already holds a snapshot of it"));
+    }
+    Ok(None)
 }
 
 async fn back_up_subject(
@@ -1079,6 +1145,81 @@ mod tests {
         assert_eq!(reports[1].outcome, SubjectOutcome::Absent);
     }
 
+    /// R1028-B4, the incident: a backed-up database disappears from under its
+    /// workload. Within the session the tail says `Vanished`, and a fresh
+    /// session (a tail restart onto the emptied volume) still says it, because
+    /// the store holds the subject's snapshot. Never `Absent`.
+    #[tokio::test]
+    async fn a_backed_up_subject_that_disappears_is_vanished_not_absent() {
+        let vol = Volume::new("vanished");
+        let subjects = vec!["accounts.db".to_string()];
+        seed(&vol.subject("accounts.db"), 0, 5).await;
+
+        let store = store();
+        let mut session = start(request(store.clone(), &vol, &subjects, Tier::Stream, "node-a"))
+            .await
+            .unwrap()
+            .expect("start");
+        let RoundOutcome::Backed(reports) = round(&mut session).await.unwrap() else {
+            panic!("not fenced");
+        };
+        assert!(matches!(reports[0].outcome, SubjectOutcome::Stream { .. }));
+
+        std::fs::remove_file(vol.subject("accounts.db")).unwrap();
+        let RoundOutcome::Backed(reports) = round(&mut session).await.unwrap() else {
+            panic!("not fenced");
+        };
+        let SubjectOutcome::Vanished { detail } = &reports[0].outcome else {
+            panic!("expected Vanished, got {:?}", reports[0].outcome);
+        };
+        assert!(detail.contains("earlier in this session"), "{detail}");
+
+        drop(session);
+        let mut restarted = start(request(store, &vol, &subjects, Tier::Stream, "node-a"))
+            .await
+            .unwrap()
+            .expect("restart");
+        let RoundOutcome::Backed(reports) = round(&mut restarted).await.unwrap() else {
+            panic!("not fenced");
+        };
+        let SubjectOutcome::Vanished { detail } = &reports[0].outcome else {
+            panic!("expected Vanished after restart, got {:?}", reports[0].outcome);
+        };
+        assert!(detail.contains("store already holds a snapshot"), "{detail}");
+    }
+
+    /// R1028-B4 residual: a restarted tier-1b tail recognises a vanished subject
+    /// from its dedup manifest, not just from the in-session flag.
+    #[tokio::test]
+    async fn a_restarted_dedup_tail_sees_a_vanished_subject_from_its_manifest() {
+        let vol = Volume::new("vanished-dedup");
+        let subjects = vec!["accounts.db".to_string()];
+        seed(&vol.subject("accounts.db"), 0, 5).await;
+        let store = store();
+        let mut session = start(request(store.clone(), &vol, &subjects, Tier::Dedup, "node-a"))
+            .await
+            .unwrap()
+            .expect("start");
+        let RoundOutcome::Backed(reports) = round(&mut session).await.unwrap() else {
+            panic!("not fenced");
+        };
+        assert!(matches!(reports[0].outcome, SubjectOutcome::Dedup(_)), "{:?}", reports[0].outcome);
+        drop(session);
+
+        std::fs::remove_file(vol.subject("accounts.db")).unwrap();
+        let mut restarted = start(request(store, &vol, &subjects, Tier::Dedup, "node-a"))
+            .await
+            .unwrap()
+            .expect("restart");
+        let RoundOutcome::Backed(reports) = round(&mut restarted).await.unwrap() else {
+            panic!("not fenced");
+        };
+        let SubjectOutcome::Vanished { detail } = &reports[0].outcome else {
+            panic!("expected Vanished after a dedup restart, got {:?}", reports[0].outcome);
+        };
+        assert!(detail.contains("store already holds a snapshot"), "{detail}");
+    }
+
     /// R932-B2, the incident: node-a holds the claim, node-b took it over, and
     /// node-a's kamaji restarts and resumes. Resume must stand down rather than
     /// mint an epoch above node-b's, which would fence the live owner.
@@ -1143,6 +1284,33 @@ mod tests {
         resume.adopt = true;
         let s = start(resume).await.unwrap().expect("acquire");
         assert_eq!(s.epoch(), claim::FIRST_EPOCH);
+    }
+
+    /// R1028-B5: a resume onto a deleted volume root refuses instead of
+    /// recreating it empty, and touches neither the disk nor the claim.
+    #[tokio::test]
+    async fn a_resume_onto_a_deleted_volume_root_refuses_and_recreates_nothing() {
+        let vol = Volume::new("adopt-gone");
+        let subjects = vec!["accounts.db".to_string()];
+        seed(&vol.subject("accounts.db"), 0, 5).await;
+        let store = store();
+        let first = start(request(store.clone(), &vol, &subjects, Tier::Stream, "node-a"))
+            .await
+            .unwrap()
+            .expect("start a");
+
+        std::fs::remove_dir_all(vol.path()).unwrap();
+        let mut resume = request(store.clone(), &vol, &subjects, Tier::Stream, "node-a");
+        resume.adopt = true;
+        match start(resume).await.unwrap() {
+            Err(TailRefusal::VolumeMissing { volume_root }) => assert_eq!(volume_root, vol.path()),
+            Err(other) => panic!("wrong refusal: {other:?}"),
+            Ok(_) => panic!("a resume recreated a deleted volume root"),
+        }
+        assert!(!vol.path().exists(), "the refusal must not recreate the root");
+        let target = BackupTarget { store, prefix: "workloads/acct".into() };
+        let held = claim::read_claim(&target).await.unwrap().expect("claim");
+        assert_eq!(held.epoch, first.epoch(), "the refusal must not touch the claim");
     }
 
     /// The fence, from the losing side. A second node's `start` displaces the

@@ -1,6 +1,6 @@
 [package]
 name = "store-claim"
-version = "0.8.51"
+version = "0.9.0"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

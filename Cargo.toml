@@ -1,6 +1,6 @@
 [package]
 name = "turso-backup"
-version = "0.8.51"
+version = "0.9.0"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
@@ -20,7 +20,7 @@ categories = ["database"]
 # excluded from yah's root), so no `workspace = true` inheritance anywhere.
 [workspace]
 members = [".", "crates/store-claim"]
-package = { version = "0.8.51" }
+package = { version = "0.9.0" }
 
 [dependencies]
 # Bumped 0.6.1 -> 0.7.2 in R830 (0.6.1 loses writes behind a live Rows).
@@ -49,7 +49,7 @@ turso_core = { version = "0.7.2", features = ["conn_raw_api"] }
 object_store = { version = "0.14", features = ["aws"] }
 anyhow = "1"
 # R971-T6: lifted out of this crate; published alongside it in the same workspace.
-store-claim = { path = "crates/store-claim", version = "0.8.51" }
+store-claim = { path = "crates/store-claim", version = "0.9.0" }
 # "time" added for R574-F2: the R2-backpressure retry loop (stream.rs /
 # backpressure.rs) needs tokio::time::sleep for 429/503 backoff.
 tokio = { version = "1", features = ["rt", "macros", "time"] }
@@ -58,6 +58,12 @@ tokio = { version = "1", features = ["rt", "macros", "time"] }
 # guard hashes the source files instead. See snapshot.rs + the working doc.
 sha2 = "0.10"
 hex = "0.4"
+# R975-F28: multipart::PartRetryStore implements ObjectStore/MultipartUpload
+# outside #[cfg(test)], so these are real deps now (all three already in the
+# tree via object_store).
+async-trait = "0.1"
+futures-util = "0.3"
+bytes = "1"
 
 # Test/example-only fake object stores. Three of them exist —
 # R574-F2's `backpressure::fault_injection::FaultyStore` (injects 429/503
@@ -73,12 +79,9 @@ hex = "0.4"
 # `[dev-dependencies]`. The harnesses are examples now (examples *can* see
 # dev-dependencies, and a measurement harness belongs there), so the
 # declared dependency surface of the published crate no longer carries a
-# measurement binary's needs. Nothing left as a real dep uses either crate:
-# every `async_trait` / `futures_util` use in `src/` is inside a
-# `#[cfg(test)]` module.
+# measurement binary's needs. (R975-F28 later made both real deps again, for
+# `multipart::PartRetryStore` -- see [dependencies].)
 [dev-dependencies]
-async-trait = "0.1"
-futures-util = "0.3"
 
 # One-shot snapshot CLI: drives snapshot_and_upload from env vars and prints
 # a single JSON line on the outcome so a task-runs beholder (or any

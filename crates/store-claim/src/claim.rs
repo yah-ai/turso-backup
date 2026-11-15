@@ -98,7 +98,7 @@ pub const FIRST_EPOCH: u64 = 1;
 /// the two fingerprint sidecars, under the same prefix, deliberately: an
 /// operator listing a prefix should see the ownership record next to the data
 /// it governs rather than in a separate administrative namespace.
-const CLAIM_LEAF: &str = "latest.owner-claim";
+pub const CLAIM_LEAF: &str = "latest.owner-claim";
 
 /// A parsed ownership claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,7 +133,10 @@ impl ClaimRecord {
     /// an absent claim: absent means "free to take", and silently taking a
     /// prefix whose owner record was merely garbled is precisely the
     /// two-live-writers outcome this module exists to prevent.
-    fn parse(text: &str) -> Result<Self> {
+    ///
+    /// Public for readers that hold the sidecar bytes from another store
+    /// client (R1050-B2: `yah cloud bucket delete`'s live-claim guard).
+    pub fn parse(text: &str) -> Result<Self> {
         let mut fields = text.split_whitespace();
         let epoch: u64 = fields
             .next()

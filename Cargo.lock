@@ -2790,7 +2790,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "store-claim"
-version = "0.8.51"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "object_store",
@@ -3322,10 +3322,11 @@ dependencies = [
 
 [[package]]
 name = "turso-backup"
-version = "0.8.51"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "futures-util",
  "hex",
  "object_store",

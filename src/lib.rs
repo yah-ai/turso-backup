@@ -45,6 +45,26 @@
 //! @yah:next("R003-F3: implement restore_latest (object_store get + write file)")
 //! @yah:next("R003-T4: green e2e in harness (writer -> snapshot sink -> MinIO -> restore -> verifier)")
 
+/// The contract version between the `turso-backup-tail` / `-hydrate` bins and
+/// a host that supervises them: their environment (`VOLUME_ROOT`, `SUBJECTS`,
+/// `ADOPT`, …), exit codes and JSON outcome lines. Each bin prints
+/// `helper-protocol <N>` for `--helper-protocol` and exits before doing any
+/// work, and yah's binary store refuses to run a rebuilt bin whose number its
+/// host does not speak (yah R1033-F5). **Bump it in the change that breaks
+/// that contract.** yah's camp host links this crate, and a test there fails
+/// until yah's `yah_bundled::BUNDLED` entries agree.
+pub const HELPER_PROTOCOL: u32 = 1;
+
+/// The `--helper-protocol` handshake both supervised bins answer first thing
+/// in `main`. `true` = it was asked and has answered; return success.
+pub fn answer_helper_protocol() -> bool {
+    if std::env::args_os().nth(1).is_some_and(|a| a == "--helper-protocol") {
+        println!("helper-protocol {HELPER_PROTOCOL}");
+        return true;
+    }
+    false
+}
+
 /// R977-B19: per-request timeout for every S3 store the bins build.
 pub const S3_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// R977-B19: total time object_store may spend retrying one request
@@ -66,6 +86,7 @@ pub fn bounded_s3(b: object_store::aws::AmazonS3Builder) -> object_store::aws::A
 }
 
 pub mod snapshot;
+pub mod multipart;
 pub mod dedup;
 pub mod stream;
 pub mod backpressure;

@@ -109,7 +109,7 @@ fn backup_target_from_env() -> Result<BackupTarget> {
         .with_context(|| format!("building S3-shaped store for {endpoint} bucket={bucket}"))?;
 
     Ok(BackupTarget {
-        store: Arc::new(store),
+        store: Arc::new(turso_backup::multipart::PartRetryStore::new(store)),
         prefix,
     })
 }

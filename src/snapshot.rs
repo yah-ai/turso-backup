@@ -173,9 +173,7 @@ pub async fn snapshot_and_upload(db_path: &str, target: &BackupTarget) -> Result
     // Genuinely new content -> upload, then record both fingerprints.
     let key = target.snapshot_key(nanos);
     let len = bytes.len();
-    target
-        .store
-        .put(&key, bytes.into())
+    crate::multipart::put_large(target.store.as_ref(), &key, bytes.into())
         .await
         .with_context(|| format!("uploading snapshot to {key}"))?;
     put_text(&target.store, &target.snapshot_fingerprint_key(), &snapshot_hash).await?;
@@ -226,9 +224,7 @@ pub async fn upload_base_snapshot(target: &BackupTarget, image: &[u8]) -> Result
         &image[..image.len().min(16)],
     );
     let key = target.snapshot_key(unix_nanos());
-    target
-        .store
-        .put(&key, image.to_vec().into())
+    crate::multipart::put_large(target.store.as_ref(), &key, image.to_vec().into())
         .await
         .with_context(|| format!("uploading base snapshot to {key}"))?;
     Ok(key.to_string())

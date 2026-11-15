@@ -94,6 +94,9 @@ const EXIT_REFUSED: u8 = 2;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    if turso_backup::answer_helper_protocol() {
+        return ExitCode::SUCCESS;
+    }
     match env::args().nth(1).as_deref() {
         None => {}
         Some("verify") => return verify_main().await,

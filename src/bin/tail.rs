@@ -36,6 +36,11 @@
 //! - `ROUNDS` — stop after N rounds instead of running forever. For tests and
 //!   one-shot operator runs; `0` (the default) means forever.
 //!
+//! `--helper-protocol` as the only argument prints `helper-protocol <N>`
+//! ([`turso_backup::HELPER_PROTOCOL`]) and exits 0 before reading any of the
+//! above: the handshake a host runs before it lets a rebuilt tail replace the
+//! one it ships.
+//!
 //! # Exit codes — the contract with the supervisor
 //!
 //! | exit | meaning | supervisor |
@@ -78,6 +83,10 @@ const DEFAULT_RPO_ROUNDS: u64 = 4;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    // Before any env is read: see `turso_backup::HELPER_PROTOCOL`.
+    if turso_backup::answer_helper_protocol() {
+        return ExitCode::SUCCESS;
+    }
     match run().await {
         Ok(Verdict::RoundsExhausted) => ExitCode::SUCCESS,
         Ok(Verdict::Fenced) => ExitCode::from(EXIT_FENCED),
@@ -142,6 +151,10 @@ async fn run() -> Result<Verdict> {
             );
             return Ok(Verdict::Fenced);
         }
+        // R1028-B5: `VolumeMissing` also lands here, deliberately exit 1: the
+        // workload may be serving the deleted databases, its only live copy,
+        // so the supervisor must keep it running; each restart re-refuses
+        // loudly until an operator acts.
         Err(refusal) => bail!("{}", refusal.headline()),
     };
     println!(
@@ -207,6 +220,10 @@ fn subject_body(outcome: &SubjectOutcome) -> String {
 
     match outcome {
         SubjectOutcome::Absent => "\"state\":\"absent\"".to_string(),
+        SubjectOutcome::Vanished { detail } => format!(
+            "\"state\":\"vanished\",\"message\":{}",
+            json_string(detail)
+        ),
         SubjectOutcome::SourceTooHot { detail } => format!(
             "\"state\":\"source_too_hot\",\"message\":{}",
             json_string(detail)
@@ -341,7 +358,8 @@ fn store_from_env() -> Result<(Arc<dyn object_store::ObjectStore>, String)> {
         .with_virtual_hosted_style_request(false)
         .build()
         .with_context(|| format!("building S3-shaped store for {endpoint} bucket={bucket}"))?;
-    Ok((Arc::new(store), prefix))
+    // R975-F28: multipart parts retry under their own part number.
+    Ok((Arc::new(turso_backup::multipart::PartRetryStore::new(store)), prefix))
 }
 
 fn json_string(s: &str) -> String {
@@ -399,6 +417,8 @@ mod tests {
     #[test]
     fn subject_states_are_distinguishable() {
         assert!(subject_body(&SubjectOutcome::Absent).contains("\"state\":\"absent\""));
+        assert!(subject_body(&SubjectOutcome::Vanished { detail: "gone".into() })
+            .contains("\"state\":\"vanished\""));
         assert!(subject_body(&SubjectOutcome::SourceTooHot {
             detail: "moved".into()
         })

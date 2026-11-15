@@ -5340,6 +5340,81 @@ mod tests {
         assert_eq!(writable, reader);
     }
 
+    /// Child half of [`legacy_reader_round_then_multiprocess_writer_next_round_reads`]:
+    /// a writer in ANOTHER process that opens the file with multiprocess WAL
+    /// (what the camp host's enrollment ledger does, R726) and holds it open.
+    /// Inert unless the parent sets `R975_B31_DB`.
+    #[tokio::test]
+    #[ignore]
+    async fn r975_b31_child_multiprocess_writer() {
+        let Ok(path) = std::env::var("R975_B31_DB") else { return };
+        let db = turso::Builder::new_local(&path)
+            .experimental_multiprocess_wal(true)
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO t (id, v) VALUES (100, 'mp')", ()).await.unwrap();
+        std::fs::write(format!("{path}.ready"), b"1").unwrap();
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+
+    /// R975-B31: a tail round opens the source in legacy mode (no `-tshm` yet),
+    /// then a writer in another process switches the file to multiprocess WAL
+    /// and holds it. The next round must still read, because every round opens
+    /// a fresh reader and [`reader_opts`] picks the mode from the filesystem at
+    /// that open. The negative control proves the switch really happened: a
+    /// legacy open at that moment is refused with the exact drill error.
+    #[tokio::test]
+    async fn legacy_reader_round_then_multiprocess_writer_next_round_reads() {
+        let src = TempDb::new("r975-b31");
+        seed_rows(src.path(), 0, 2).await;
+        let tshm = format!("{}-tshm", src.path());
+        let ready = format!("{}.ready", src.path());
+        assert!(!std::path::Path::new(&tshm).exists(), "precondition: legacy file");
+        let first = CoreWalSeam::open_reader(src.path()).unwrap().wal_state().unwrap();
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "stream::tests::r975_b31_child_multiprocess_writer"])
+            .env("R975_B31_DB", src.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut up = false;
+        for _ in 0..400 {
+            if std::path::Path::new(&ready).exists() { up = true; break; }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let outcome = (|| -> Result<(Watermark, String)> {
+            anyhow::ensure!(up, "child writer never came up");
+            anyhow::ensure!(std::path::Path::new(&tshm).exists(), "writer made no -tshm");
+            let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
+            let legacy = turso_core::Database::open_file_with_flags(
+                io,
+                src.path(),
+                turso_core::OpenFlags::ReadOnly,
+                turso_core::DatabaseOpts::new(),
+                None,
+            );
+            let refused = match legacy {
+                Ok(_) => String::new(),
+                Err(e) => e.to_string(),
+            };
+            let next = CoreWalSeam::open_reader(src.path())?.wal_state()?;
+            Ok((next, refused))
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&ready);
+        let _ = std::fs::remove_file(&tshm);
+        let (next, refused) = outcome.unwrap();
+        assert!(
+            refused.contains("already open with experimental multiprocess WAL"),
+            "negative control: a legacy open must be refused once the writer is multiprocess, got {refused:?}"
+        );
+        assert!(next.last_frame > first.last_frame, "next round sees the writer's commit: {first:?} -> {next:?}");
+    }
+
     /// R936-B2, the prod headscale failover: a base written by upstream SQLite
     /// with `auto_vacuum=INCREMENTAL` (what headscale runs) must open WRITABLE
     /// with a real WAL, so frames replay onto it. Before the fix turso_core
